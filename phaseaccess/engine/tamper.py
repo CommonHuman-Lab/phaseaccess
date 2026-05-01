@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 CommonHuman-Lab
+
 """
 PhaseAccess — engine/tamper.py
 HTTP request replayer: substitutes tampered ID values and fires the request,

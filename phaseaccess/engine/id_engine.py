@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 CommonHuman-Lab
+
 """
 PhaseAccess — engine/id_engine.py
 ID type detection, analysis, and candidate generation.

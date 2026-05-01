@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 CommonHuman-Lab
+
 """
 PhaseAccess — engine/har_import.py
 Import HTTP traffic from HAR (HTTP Archive) and Burp Suite XML files.

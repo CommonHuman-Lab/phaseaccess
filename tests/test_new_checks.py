@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 CommonHuman-Lab
+
 """
 Tests for the three new IDOR detection checks:
   - BLIND  (_check_blind_idor)

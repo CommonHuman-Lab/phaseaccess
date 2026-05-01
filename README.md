@@ -42,7 +42,7 @@ pip install phaseaccess
 Or from source:
 
 ```bash
-git clone https://github.com/anomalyco/phaseaccess
+git clone https://github.com/CommonHuman-Lab/phaseaccess.git
 cd phaseaccess
 pip install -e .
 ```

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 CommonHuman-Lab
+
 """
 T6-22: Scanner integration test using a real in-process HTTP server.
 
