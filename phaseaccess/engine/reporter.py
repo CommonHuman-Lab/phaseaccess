@@ -97,6 +97,7 @@ class IDORFinding:
 
   # Extra context
   notes: str = ""
+  curl_command: str = ""   # reproduction command
 
   def to_dict(self) -> Dict[str, Any]:
     return {
@@ -118,6 +119,7 @@ class IDORFinding:
       "session_a_label":    self.session_a_label,
       "session_b_label":    self.session_b_label,
       "notes":              self.notes,
+      "curl_command":       self.curl_command,
     }
 
 

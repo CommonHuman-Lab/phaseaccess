@@ -162,7 +162,7 @@ def compare(
     for field_name, foreign_val in known_foreign_values.items():
       if (
         foreign_val
-        and len(foreign_val) > 2
+        and len(foreign_val) >= 8
         and foreign_val in tampered.body
         and foreign_val not in baseline.body
       ):
@@ -179,6 +179,24 @@ def compare(
         if snippet:
           evidence += f" | snippet: {snippet}"
 
+  # 8. Timing oracle — significant latency difference may indicate backend
+  #    actually fetched a resource (e.g. a slow DB hit vs fast 403/404 path).
+  #    Only fire when status codes are both 2xx (i.e. not a 404 fast-path).
+  timing_signal = False
+  if (
+    baseline.elapsed_ms > 0
+    and tampered.elapsed_ms > 0
+    and baseline.status in range(200, 300)
+    and tampered.status in range(200, 300)
+  ):
+    ratio = tampered.elapsed_ms / baseline.elapsed_ms
+    if ratio > 3.0 or ratio < 0.33:
+      signals.append(
+        f"timing delta: baseline {baseline.elapsed_ms:.0f}ms "
+        f"→ tampered {tampered.elapsed_ms:.0f}ms (ratio {ratio:.1f}x)"
+      )
+      timing_signal = True
+
   # --- Derive verdict ---
   verdict, confidence = _verdict(
     status_delta=status_delta,
@@ -190,6 +208,7 @@ def compare(
     length_ratio=length_ratio,
     baseline_status=baseline.status,
     tampered_status=tampered.status,
+    timing_signal=timing_signal,
   )
 
   # Extract diff snippet if no evidence yet
@@ -224,6 +243,7 @@ def _verdict(
   length_ratio:     float,
   baseline_status:  int,
   tampered_status:  int,
+  timing_signal:    bool = False,
 ) -> Tuple[DiffVerdict, Confidence]:
 
   # CONFIRMED: ownership field with foreign value proven
@@ -249,6 +269,10 @@ def _verdict(
   # POSSIBLE: structural change or substantial content change
   if struct_changed or (hash_changed and abs(length_delta) > 100):
     return DiffVerdict.POSSIBLE, Confidence.MEDIUM
+
+  # POSSIBLE: timing oracle fired (significant latency difference with 2xx/2xx)
+  if timing_signal:
+    return DiffVerdict.POSSIBLE, Confidence.LOW
 
   # LOW: only status code changed (could be rate limit, CSRF, etc.)
   if status_delta != 0:

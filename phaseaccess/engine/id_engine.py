@@ -257,15 +257,17 @@ def _uuid_candidates(value: str, id_type: IDType, count: int) -> List[TamperCand
     except Exception as exc:
       logger.debug("UUID v1 candidate generation failed for %r: %s", value, exc)
 
-  # For all UUID types: generate random v4s (tests whether format is validated)
-  for i in range(min(3, count)):
-    results.append(TamperCandidate(str(uuid.uuid4()), f"random UUID v4 #{i+1}"))
-
-  # Malformed UUIDs to test validation
+  # Nil and max UUIDs — predictable edge cases that test input validation
   results.append(TamperCandidate(
     "00000000-0000-0000-0000-000000000000", "nil UUID"))
   results.append(TamperCandidate(
     "ffffffff-ffff-ffff-ffff-ffffffffffff", "max UUID"))
+
+  # NOTE: random UUID v4 candidates are intentionally NOT generated here.
+  # They produce false positives (format accepted, random resource not found
+  # → 404, indistinguishable from access control).  Foreign UUIDs from the
+  # harvested pool (real IDs of other users) are added by generate_candidates()
+  # as foreign TamperCandidates and are far more meaningful.
 
   return results
 

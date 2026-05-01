@@ -12,8 +12,8 @@ OWNERSHIP_KEYS: frozenset[str] = frozenset({
     'owner_id', 'ownerId', 'owner',
     'account_id', 'accountId',
     'created_by', 'createdBy',
-    'author_id', 'authorId', 'author',
+    'author_id', 'authorId',
     'email', 'username', 'handle', 'phone',
     'assigned_to', 'assignedTo',
-    'name', 'full_name', 'fullName',
+    'fullName',
 })

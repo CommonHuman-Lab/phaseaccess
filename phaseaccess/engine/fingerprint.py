@@ -36,9 +36,13 @@ _VOLATILE_PATTERNS = [
   re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}'),   # ISO timestamps
   re.compile(r'"(updated_at|created_at|timestamp|expires|issued_at|iat|exp)"\s*:\s*\d+'),
   re.compile(r'"(nonce|csrf|_token|xsrf)"\s*:\s*"[^"]+"', re.IGNORECASE),
-  re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-             re.IGNORECASE),  # UUIDs in body
 ]
+
+# UUID pattern — kept separate so we can apply it selectively
+_RE_UUID_BODY = re.compile(
+  r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+  re.IGNORECASE,
+)
 
 _VOLATILE_HEADER_KEYS = {
   'date', 'x-request-id', 'x-trace-id', 'x-correlation-id',
@@ -99,19 +103,26 @@ class ResponseFingerprint:
 # ---------------------------------------------------------------------------
 
 def fingerprint_response(
-  url:        str,
-  method:     str,
-  status:     int,
-  body:       str,
-  headers:    Dict[str, str],
-  elapsed_ms: float = 0.0,
+  url:           str,
+  method:        str,
+  status:        int,
+  body:          str,
+  headers:       Dict[str, str],
+  elapsed_ms:    float = 0.0,
+  baseline_body: Optional[str] = None,
 ) -> ResponseFingerprint:
   """
   Build a ResponseFingerprint from a raw HTTP response.
   Called after every request — both baseline and tampered.
+
+  `baseline_body` — when provided (tampered requests), UUIDs that were
+  already present in the baseline are treated as volatile and stripped
+  from the stable hash.  UUIDs that are NEW in the tampered response
+  (potential cross-user IDs) are preserved in the hash, making them
+  detectable as a meaningful difference.
   """
   content_type = _get_header(headers, 'content-type', '')
-  stable       = _stabilise(body)
+  stable       = _stabilise(body, baseline_body=baseline_body)
   stable_hash  = hashlib.sha256(stable.encode()).hexdigest()[:16]
   json_keys, ownership, structure_sig = _analyse_json(body, content_type)
 
@@ -146,7 +157,8 @@ def build_baseline(
 ) -> Optional[ResponseFingerprint]:
   """
   Fetch the URL `repeats` times with the *owner's* credentials and return
-  the most stable fingerprint.  Two fetches lets us flag volatile fields.
+  the most stable fingerprint.  Two fetches lets us detect volatile fields
+  (values that differ between fetches) so we don't false-positive on them.
 
   Returns None on network failure.
   """
@@ -164,8 +176,71 @@ def build_baseline(
     logger.warning("Baseline fetch failed for %s", url)
     return None
 
-  # Return the first; caller uses comparator to diff against tampered responses
+  # If we have two fetches, identify JSON field values that changed between
+  # them (truly volatile) and bake those volatile values into the first
+  # fingerprint's stable_hash so tampered responses won't be compared against
+  # them.
+  if len(fps) >= 2:
+    volatile_vals = _detect_volatile_values(fps[0].body, fps[1].body)
+    if volatile_vals:
+      fps[0] = _rebuild_with_extra_volatiles(fps[0], volatile_vals)
+
   return fps[0]
+
+
+def _detect_volatile_values(body1: str, body2: str) -> List[str]:
+  """
+  Compare two JSON response bodies and return scalar values that differ
+  between them (per key).  These are runtime-volatile values (timestamps,
+  nonces, session tokens embedded in body, etc.) that should be ignored
+  when comparing a tampered response against the baseline.
+  """
+  volatile: List[str] = []
+  for body in (body1, body2):
+    if not body.strip().startswith(('{', '[')):
+      return volatile
+  try:
+    obj1 = json.loads(body1)
+    obj2 = json.loads(body2)
+  except json.JSONDecodeError:
+    return volatile
+
+  def _collect(o1: Any, o2: Any) -> None:
+    if isinstance(o1, dict) and isinstance(o2, dict):
+      for k in o1:
+        if k in o2:
+          _collect(o1[k], o2[k])
+    elif isinstance(o1, list) and isinstance(o2, list):
+      for a, b in zip(o1[:10], o2[:10]):
+        _collect(a, b)
+    elif o1 != o2:
+      # Scalar values that differ between the two fetches are volatile
+      for v in (o1, o2):
+        s = str(v)
+        # Only add if meaningful length; short values like "1"/"2" are noise
+        if len(s) >= 6:
+          volatile.append(s)
+
+  _collect(obj1, obj2)
+  return volatile
+
+
+def _rebuild_with_extra_volatiles(
+  fp: "ResponseFingerprint",
+  volatile_vals: List[str],
+) -> "ResponseFingerprint":
+  """
+  Re-compute the stable_hash of `fp` after stripping `volatile_vals`
+  from the body.  Returns a new ResponseFingerprint with the updated hash.
+  """
+  body = fp.body
+  for val in volatile_vals:
+    body = body.replace(val, '__VOLATILE__')
+  # Also apply the standard stabilise pass (already applied, but idempotent)
+  stable = _stabilise(body, baseline_body=None)
+  new_hash = hashlib.sha256(stable.encode()).hexdigest()[:16]
+  import dataclasses
+  return dataclasses.replace(fp, stable_hash=new_hash)
 
 
 def _fetch_fingerprint(
@@ -265,10 +340,33 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _stabilise(body: str) -> str:
-  """Strip volatile values from body before hashing."""
+def _stabilise(body: str, baseline_body: Optional[str] = None) -> str:
+  """
+  Strip volatile values from body before hashing.
+
+  If `baseline_body` is provided, only UUIDs that appeared in the
+  baseline are stripped (they are known-stable noise).  New UUIDs in
+  the tampered response are preserved so the comparator can detect them
+  as evidence of cross-user data leakage.
+
+  Without `baseline_body` (i.e. when fingerprinting the baseline itself)
+  all UUIDs are stripped so the baseline hash is UUID-agnostic for the
+  purposes of non-UUID field comparison.
+  """
   for pat in _VOLATILE_PATTERNS:
     body = pat.sub('__VOLATILE__', body)
+
+  if baseline_body is None:
+    # Baseline: strip all UUIDs
+    body = _RE_UUID_BODY.sub('__VOLATILE__', body)
+  else:
+    # Tampered: strip only UUIDs that were in the baseline
+    baseline_uuids = set(_RE_UUID_BODY.findall(baseline_body))
+    for uid in baseline_uuids:
+      body = body.replace(uid, '__VOLATILE__')
+      body = body.replace(uid.lower(), '__VOLATILE__')
+      body = body.replace(uid.upper(), '__VOLATILE__')
+
   return body
 
 

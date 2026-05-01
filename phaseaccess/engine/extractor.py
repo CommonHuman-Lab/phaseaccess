@@ -93,8 +93,9 @@ class ObjectRef:
   id_type:    IDType
   url:        str
   method:     str               # HTTP method this applies to
-  # For POST/JSON bodies — the full body dict (needed to replay the request)
-  body_context: Optional[Dict[str, Any]] = None
+  # For JSON bodies — the full body dict (needed to replay the request)
+  # For POST_BODY (form-encoded) — the raw body string (all fields preserved)
+  body_context: Optional[Any] = None
   # For headers
   header_name: Optional[str] = None
 
@@ -185,6 +186,7 @@ def extract_from_body(url: str, method: str, raw_body: str) -> List[ObjectRef]:
         id_type=detect_id_type(value),
         url=url,
         method=method,
+        body_context=raw_body,   # preserve the full raw form string
       ))
 
   return refs
@@ -195,7 +197,10 @@ def extract_from_headers(url: str, method: str,
   """Extract object references from HTTP request headers."""
   refs: List[ObjectRef] = []
   for name, value in headers.items():
-    if name.lower() in _ID_HEADERS:
+    name_lower = name.lower()
+
+    # Known ID-bearing custom headers
+    if name_lower in _ID_HEADERS:
       refs.append(ObjectRef(
         location=IDORLocation.HEADER,
         param=name,
@@ -205,6 +210,45 @@ def extract_from_headers(url: str, method: str,
         method=method,
         header_name=name,
       ))
+      continue
+
+    # Authorization: Bearer <JWT> — extract as JWT_CLAIM ref
+    if name_lower == 'authorization':
+      stripped = value.strip()
+      if stripped.lower().startswith('bearer '):
+        token = stripped[7:].strip()
+        if token and detect_id_type(token) == IDType.JWT:
+          refs.append(ObjectRef(
+            location=IDORLocation.JWT_CLAIM,
+            param='Authorization',
+            value=token,
+            id_type=IDType.JWT,
+            url=url,
+            method=method,
+            header_name='Authorization',
+          ))
+      continue
+
+    # Cookie header — split into individual cookies and extract ID-like ones
+    if name_lower == 'cookie':
+      for cookie_pair in value.split(';'):
+        cookie_pair = cookie_pair.strip()
+        if '=' not in cookie_pair:
+          continue
+        cname, _, cval = cookie_pair.partition('=')
+        cname = cname.strip()
+        cval  = cval.strip()
+        if _is_id_param(cname) or _looks_like_id(cval):
+          refs.append(ObjectRef(
+            location=IDORLocation.COOKIE,
+            param=cname,
+            value=cval,
+            id_type=detect_id_type(cval),
+            url=url,
+            method=method,
+            header_name='Cookie',
+          ))
+
   return refs
 
 

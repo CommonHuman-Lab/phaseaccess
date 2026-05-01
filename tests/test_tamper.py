@@ -159,3 +159,57 @@ class TestSetNested:
         _set_nested(obj, "user.id", 2)
         assert obj["user"]["name"] == "Alice"
         assert obj["user"]["role"] == "admin"
+
+
+# ---------------------------------------------------------------------------
+# T6-21: POST_BODY body_context field preservation
+# ---------------------------------------------------------------------------
+
+class TestPostBodyFieldPreservation:
+    """
+    Ensure that when replaying a POST_BODY request, all original form fields
+    are preserved and only the targeted field is changed.
+    """
+
+    def _make_post_ref(self, raw_body: str, param: str, value: str):
+        from phaseaccess.engine.extractor import ObjectRef
+        from phaseaccess.engine.reporter import IDORLocation, IDType
+        return ObjectRef(
+            location=IDORLocation.POST_BODY,
+            param=param,
+            value=value,
+            id_type=IDType.INTEGER,
+            url="https://api.example.com/order",
+            method="POST",
+            body_context=raw_body,
+        )
+
+    def test_all_original_fields_preserved(self):
+        from phaseaccess.engine.tamper import _build_request
+        import urllib.parse as up
+        raw = "user_id=42&csrf_token=abc123&action=update&amount=100"
+        ref = self._make_post_ref(raw, "user_id", "42")
+        _url, headers, body = _build_request(ref, "99", {}, "")
+        parsed = up.parse_qs(body)
+        assert parsed["user_id"] == ["99"]
+        assert parsed["csrf_token"] == ["abc123"]
+        assert parsed["action"] == ["update"]
+        assert parsed["amount"] == ["100"]
+
+    def test_only_targeted_field_changed(self):
+        from phaseaccess.engine.tamper import _build_request
+        import urllib.parse as up
+        raw = "order_id=7&discount=5&note=hello"
+        ref = self._make_post_ref(raw, "order_id", "7")
+        _url, headers, body = _build_request(ref, "999", {}, "")
+        parsed = up.parse_qs(body)
+        assert parsed["order_id"] == ["999"]
+        assert parsed["discount"] == ["5"]
+        assert parsed["note"] == ["hello"]
+
+    def test_content_type_set_correctly(self):
+        from phaseaccess.engine.tamper import _build_request
+        raw = "id=1&foo=bar"
+        ref = self._make_post_ref(raw, "id", "1")
+        _url, headers, body = _build_request(ref, "2", {}, "")
+        assert headers.get("Content-Type") == "application/x-www-form-urlencoded"

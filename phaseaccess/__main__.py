@@ -284,6 +284,12 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("-t", "--threads",  type=int, default=5)
   p.add_argument("--timeout",        type=int, default=15)
   p.add_argument("--max-candidates", type=int, default=10)
+  p.add_argument("--targets",        default="",
+                 help="Import targets from HAR / Burp XML / JSON file")
+  p.add_argument("--min-confidence", default="", dest="min_confidence",
+                 help="Minimum confidence to report: confirmed high medium low info")
+  p.add_argument("--user-agent",     default="", dest="user_agent",
+                 help="Override User-Agent header (default: PhaseAccess/1.0)")
   p.add_argument("--no-method-bypass",   action="store_true")
   p.add_argument("--no-param-pollution", action="store_true")
   p.add_argument("--no-mass-assignment", action="store_true")
@@ -337,6 +343,23 @@ def main() -> None:
   session_a_headers = _parse_headers(args.header)
   session_b_headers = _parse_headers(args.header_b)
 
+  # --targets: load extra URLs from HAR / Burp XML / JSON file
+  imported_extra_urls: list[str] = []
+  if getattr(args, 'targets', ''):
+    try:
+      from phaseaccess.engine.har_import import load_file as _load_import
+    except ImportError:
+      from engine.har_import import load_file as _load_import  # type: ignore
+    imported_targets = _load_import(args.targets)
+    for t in imported_targets:
+      u = t.get('url', '')
+      if u and u not in imported_extra_urls:
+        imported_extra_urls.append(u)
+    if not args.quiet and not args.json_output:
+      print(DIM(f"[*] Imported {len(imported_extra_urls)} URL(s) from {args.targets}"))
+
+  combined_extra_urls = list(args.extra_url) + imported_extra_urls
+
   def live_log(msg: str) -> None:
     if args.quiet or args.json_output:
       return
@@ -369,7 +392,8 @@ def main() -> None:
     mass_assignment=not args.no_mass_assignment,
     soft_delete=not args.no_soft_delete,
     blind_idor=not args.no_blind_idor,
-    extra_urls=args.extra_url,
+    extra_urls=combined_extra_urls,
+    user_agent=getattr(args, 'user_agent', '') or 'PhaseAccess/1.0',
     on_log=live_log,
   )
 
@@ -386,6 +410,16 @@ def main() -> None:
     print()
 
   result = scan(args.url, opts)
+
+  # Apply --min-confidence filter
+  min_conf = getattr(args, 'min_confidence', '').lower().strip()
+  _CONF_RANK = {'confirmed': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+  if min_conf and min_conf in _CONF_RANK:
+    threshold = _CONF_RANK[min_conf]
+    result.findings = [
+      f for f in result.findings
+      if _CONF_RANK.get(f.confidence.lower(), 99) <= threshold
+    ]
 
   if args.json_output:
     output_text = json.dumps(result.to_dict(), indent=2)
@@ -459,6 +493,8 @@ def _format_human(result: any, mode: str) -> list[str]:
         lines.append(f"      Evidence  : {DIM(f.evidence_snippet[:120])}")
       if f.notes:
         lines.append(f"      Signals   : {DIM(f.notes)}")
+      if f.curl_command:
+        lines.append(f"      Reproduce : {DIM(f.curl_command[:200])}")
       lines.append("")
 
   if result.harvested_ids:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import concurrent.futures
 import json as _json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -66,6 +67,7 @@ class ScanOptions:
   # TLS / network
   verify_ssl: bool  = True    # set False to skip certificate verification
   delay:      float = 0.0     # seconds between requests (rate limiting)
+  user_agent: str   = "PhaseAccess/1.0"
 
   # Scan breadth
   threads:          int = 5
@@ -111,12 +113,13 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
 
   # Harvested IDs from session_a responses (for ID chaining)
   harvested_pool: Dict[str, List[str]] = {}
+  harvested_lock = threading.Lock()
 
   with concurrent.futures.ThreadPoolExecutor(max_workers=opts.threads) as pool:
     futures = {
       pool.submit(
         _scan_endpoint,
-        url, opts, session_pair, harvested_pool, log,
+        url, opts, session_pair, harvested_pool, harvested_lock, log,
       ): url
       for url in all_urls
     }
@@ -129,7 +132,7 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
         result.parameters_tested += ep_result.parameters_tested
         result.requests_sent += ep_result.requests_sent
         result.errors.extend(ep_result.errors)
-        # Merge harvested IDs
+        # Merge harvested IDs (lock not needed here; futures are already done)
         for k, vals in ep_result.harvested_ids.items():
           harvested_pool.setdefault(k, []).extend(vals)
       except Exception as e:
@@ -139,6 +142,9 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
   result.id_types_found = list({
     f.id_type for f in result.findings
   })
+
+  # Deduplicate: keep highest-confidence finding per (url, parameter) pair
+  result.findings = _deduplicate_findings(result.findings)
 
   result.finish()
   log(f"[*] Scan complete — {result.total_findings} finding(s) in {result.duration_s}s")
@@ -154,6 +160,7 @@ def _scan_endpoint(
   opts:          ScanOptions,
   pair:          SessionPair,
   harvested_pool: Dict[str, List[str]],
+  harvested_lock: threading.Lock,
   log:           Callable[[str], None],
 ) -> ScanResult:
   """Scan a single endpoint and return a partial ScanResult."""
@@ -247,6 +254,7 @@ def _scan_endpoint(
         timeout=opts.timeout,
         verify_ssl=opts.verify_ssl,
         delay=opts.delay,
+        baseline_body=baseline.body,
       )
       partial.requests_sent += 1
 
@@ -282,6 +290,12 @@ def _scan_endpoint(
           session_a_label=opts.session_a_label,
           session_b_label=opts.session_b_label,
           notes="; ".join(diff.signals[:5]),
+          curl_command=_build_curl_command(
+            tamper_result.effective_url,
+            opts.method,
+            tamper_result.effective_headers,
+            tamper_result.effective_body,
+          ),
         )
         partial.findings.append(finding)
         log(
@@ -292,7 +306,10 @@ def _scan_endpoint(
         if diff.verdict == DiffVerdict.CONFIRMED:
           break
 
-      # 4b. Blind IDOR check — runs on every candidate, regardless of diff verdict
+        # Skip blind IDOR — we already have a regular finding for this candidate
+        continue
+
+      # 4b. Blind IDOR check — only when normal comparator produced no finding
       if opts.blind_idor:
         blind = _check_blind_idor(
           ref, baseline, tamper_result.fingerprint,
@@ -334,6 +351,8 @@ def _scan_endpoint(
             tampered_length=mr.fingerprint.body_length,
             owner_fields_leaked=diff.leaked_fields,
             evidence_snippet=diff.evidence_snippet,
+            session_a_label=opts.session_a_label,
+            session_b_label=opts.session_b_label,
             notes=f"method bypass via {mr.ref.method}",
           ))
           log(f"[+] METHOD BYPASS {mr.ref.method} {ref.param} @ {url}")
@@ -370,6 +389,8 @@ def _scan_endpoint(
             tampered_length=pp_result.fingerprint.body_length,
             owner_fields_leaked=diff.leaked_fields,
             evidence_snippet=diff.evidence_snippet,
+            session_a_label=opts.session_a_label,
+            session_b_label=opts.session_b_label,
             notes="HTTP parameter pollution",
           ))
 
@@ -405,19 +426,61 @@ def _scan_endpoint(
 
 def _build_session_pair(opts: ScanOptions) -> SessionPair:
   from .session import Session
+  ua = opts.user_agent or "PhaseAccess/1.0"
+  a_headers = dict(opts.session_a_headers)
+  a_headers.setdefault('User-Agent', ua)
   session_a = Session(
     label=opts.session_a_label,
-    headers=opts.session_a_headers,
+    headers=a_headers,
     cookies=opts.session_a_cookies,
   )
   session_b: Optional[Session] = None
   if opts.session_b_label:
+    b_headers = dict(opts.session_b_headers)
+    b_headers.setdefault('User-Agent', ua)
     session_b = Session(
       label=opts.session_b_label,
-      headers=opts.session_b_headers,
+      headers=b_headers,
       cookies=opts.session_b_cookies,
     )
   return SessionPair(session_a=session_a, session_b=session_b)
+
+
+def _deduplicate_findings(findings: List[IDORFinding]) -> List[IDORFinding]:
+  """
+  For each (url, parameter, idor_type) tuple keep only the finding with the
+  highest confidence.  Preserves original order (first occurrence wins on tie).
+  """
+  _CONF_ORDER = [
+    Confidence.CONFIRMED,
+    Confidence.HIGH,
+    Confidence.MEDIUM,
+    Confidence.LOW,
+    Confidence.INFO,
+  ]
+
+  def _rank(c: str) -> int:
+    try:
+      return _CONF_ORDER.index(c)
+    except ValueError:
+      return len(_CONF_ORDER)
+
+  best: Dict[tuple, IDORFinding] = {}
+  for f in findings:
+    key = (f.url, f.parameter, f.idor_type)
+    existing = best.get(key)
+    if existing is None or _rank(f.confidence) < _rank(existing.confidence):
+      best[key] = f
+
+  # Restore original ordering
+  seen: set = set()
+  result: List[IDORFinding] = []
+  for f in findings:
+    key = (f.url, f.parameter, f.idor_type)
+    if key not in seen and best.get(key) is f:
+      seen.add(key)
+      result.append(f)
+  return result
 
 
 def _classify_idor_type(
@@ -462,6 +525,10 @@ def _check_mass_assignment(
   # Build an injected body
   if ref.location == IDORLocation.JSON_BODY and isinstance(ref.body_context, dict):
     injected = dict(ref.body_context)
+  elif ref.location == IDORLocation.POST_BODY and isinstance(ref.body_context, str):
+    import urllib.parse as _up2
+    injected = {k: v[0] for k, v in _up2.parse_qs(
+        ref.body_context, keep_blank_values=True).items()}
   else:
     injected = {}
 
@@ -513,6 +580,8 @@ def _check_mass_assignment(
     tampered_length=fp.body_length,
     owner_fields_leaked=diff.leaked_fields,
     evidence_snippet=diff.evidence_snippet,
+    session_a_label=opts.session_a_label,
+    session_b_label=opts.session_b_label,
     notes="mass assignment: injected ownership field accepted" + (
       "; injected value reflected in response" if injected_reflected else ""
     ),
@@ -582,6 +651,8 @@ def _check_soft_delete(
         tampered_length=fp.body_length,
         owner_fields_leaked=[],
         evidence_snippet=fp.body[:500],
+        session_a_label=opts.session_a_label,
+        session_b_label=opts.session_b_label,
         notes=f"soft-delete bypass: {param}={value} reveals deleted resource",
       )
 
@@ -605,6 +676,8 @@ def _check_soft_delete(
           tampered_length=fp.body_length,
           owner_fields_leaked=[],
           evidence_snippet=fp.body[:500],
+          session_a_label=opts.session_a_label,
+          session_b_label=opts.session_b_label,
           notes=f"soft-delete bypass: {param}={value} returns extra content",
         )
 
@@ -666,9 +739,31 @@ def _check_blind_idor(
 
 
 # ---------------------------------------------------------------------------
-# Shared single-request helper (used by mass-assignment + soft-delete)
+# curl reproduction command builder
 # ---------------------------------------------------------------------------
 
+def _build_curl_command(
+  url:     str,
+  method:  str,
+  headers: Dict[str, str],
+  body:    str,
+) -> str:
+  """Build a curl command string for reproducing a finding."""
+  import shlex
+  parts = ["curl", "-s", "-X", method]
+  for k, v in headers.items():
+    if k.lower() in ('host', 'content-length'):
+      continue
+    parts += ["-H", f"{k}: {v}"]
+  if body:
+    parts += ["--data-raw", body]
+  parts.append(url)
+  return " ".join(shlex.quote(p) for p in parts)
+
+
+# ---------------------------------------------------------------------------
+# Shared single-request helper (used by mass-assignment + soft-delete)
+# ---------------------------------------------------------------------------
 def _do_single_request(
   url:        str,
   method:     str,

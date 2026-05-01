@@ -44,6 +44,14 @@ class TamperResult:
   tampered_value:   str               # what we substituted
   description:      str               # human-readable why
   fingerprint:      ResponseFingerprint
+  # Effective request details (for curl reproduction)
+  effective_url:    str = ""
+  effective_headers: Dict[str, str] = None  # type: ignore
+  effective_body:   str = ""
+
+  def __post_init__(self) -> None:
+    if self.effective_headers is None:
+      self.effective_headers = {}
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +68,7 @@ def send_tampered(
   timeout:        int = 15,
   verify_ssl:     bool = True,
   delay:          float = 0.0,
+  baseline_body:  Optional[str] = None,
 ) -> Optional[TamperResult]:
   """
   Re-issue `ref.url` with `tampered_value` substituted for `ref.value`
@@ -77,7 +86,8 @@ def send_tampered(
   if delay > 0:
     time.sleep(delay)
 
-  fp = _do_request(url, ref.method, headers, body, proxy, timeout, verify_ssl=verify_ssl)
+  fp = _do_request(url, ref.method, headers, body, proxy, timeout,
+                   verify_ssl=verify_ssl, baseline_body=baseline_body)
   if fp is None:
     return None
 
@@ -86,6 +96,9 @@ def send_tampered(
     tampered_value=tampered_value,
     description=description,
     fingerprint=fp,
+    effective_url=url,
+    effective_headers=headers,
+    effective_body=body,
   )
 
 
@@ -199,11 +212,9 @@ def _build_request(
     url = _replace_path_segment(url, ref.param, ref.value, tampered)
 
   elif loc == IDORLocation.POST_BODY:
-    # Form-encoded body
-    parsed_body = up.parse_qs(
-      ref.body_context if isinstance(ref.body_context, str) else "",
-      keep_blank_values=True,
-    )
+    # Form-encoded body — start from the original raw body to preserve all fields
+    original_raw = ref.body_context if isinstance(ref.body_context, str) else ""
+    parsed_body = up.parse_qs(original_raw, keep_blank_values=True)
     parsed_body[ref.param] = [tampered]
     body = up.urlencode(
       {k: v[0] for k, v in parsed_body.items()},
@@ -242,14 +253,15 @@ def _build_request(
 # ---------------------------------------------------------------------------
 
 def _do_request(
-  url:        str,
-  method:     str,
-  headers:    Dict[str, str],
-  body:       str,
-  proxy:      str,
-  timeout:    int,
-  verify_ssl: bool = True,
-  _retries:   int = 2,
+  url:           str,
+  method:        str,
+  headers:       Dict[str, str],
+  body:          str,
+  proxy:         str,
+  timeout:       int,
+  verify_ssl:    bool = True,
+  _retries:      int = 2,
+  baseline_body: Optional[str] = None,
 ) -> Optional[ResponseFingerprint]:
   body_bytes = body.encode() if body else None
   req = _req.Request(url, data=body_bytes, headers=headers, method=method)
@@ -281,6 +293,7 @@ def _do_request(
         body=resp_body,
         headers=resp_headers,
         elapsed_ms=elapsed_ms,
+        baseline_body=baseline_body,
       )
 
     except urllib.error.HTTPError as exc:
@@ -302,6 +315,7 @@ def _do_request(
           body=resp_body,
           headers=resp_headers,
           elapsed_ms=elapsed_ms,
+          baseline_body=baseline_body,
         )
       except Exception as inner:
         logger.debug("Failed to read HTTPError body for %s: %s", url, inner)
