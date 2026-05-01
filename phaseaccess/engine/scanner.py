@@ -21,12 +21,16 @@ Standalone-safe: stdlib only.
 from __future__ import annotations
 
 import concurrent.futures
+import json as _json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 from .reporter import (
-  IDORFinding, IDORType, IDORLocation, Confidence, ScanResult,
+  IDORFinding, IDORType, IDORLocation, Confidence, IDType, ScanResult,
 )
 from .extractor import (
   ObjectRef, extract_all, harvest_ids_from_response,
@@ -59,11 +63,18 @@ class ScanOptions:
   proxy:   str = ""
   timeout: int = 15
 
+  # TLS / network
+  verify_ssl: bool  = True    # set False to skip certificate verification
+  delay:      float = 0.0     # seconds between requests (rate limiting)
+
   # Scan breadth
   threads:          int = 5
   max_candidates:   int = 10           # tamper candidates per parameter
   method_bypass:    bool = True        # test HTTP method bypass
   param_pollution:  bool = True        # test HPP
+  mass_assignment:  bool = True        # test mass assignment on JSON body endpoints
+  soft_delete:      bool = True        # test soft-delete bypass via hint params
+  blind_idor:       bool = True        # detect blind IDOR via status-only signals
 
   # Extra endpoints to test (in addition to the primary target)
   extra_urls: List[str] = field(default_factory=list)
@@ -95,6 +106,8 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
   all_urls = [target] + (opts.extra_urls or [])
   log(f"[*] PhaseAccess starting — {len(all_urls)} endpoint(s)")
   log(f"[*] Mode: {'dual-session' if session_pair.is_dual else 'single-session'}")
+  if not opts.verify_ssl:
+    log("[!] SSL certificate verification disabled (--insecure)")
 
   # Harvested IDs from session_a responses (for ID chaining)
   harvested_pool: Dict[str, List[str]] = {}
@@ -156,6 +169,8 @@ def _scan_endpoint(
     cookies=pair.cookies_for('a'),
     proxy=opts.proxy,
     timeout=opts.timeout,
+    verify_ssl=opts.verify_ssl,
+    delay=opts.delay,
   )
   if baseline is None:
     partial.errors.append(f"Baseline fetch failed: {url}")
@@ -188,6 +203,8 @@ def _scan_endpoint(
       cookies=pair.cookies_for('b'),
       proxy=opts.proxy,
       timeout=opts.timeout,
+      verify_ssl=opts.verify_ssl,
+      delay=opts.delay,
     )
     partial.requests_sent += 1
     if b_baseline:
@@ -228,6 +245,8 @@ def _scan_endpoint(
         cookies=req_cookies,
         proxy=opts.proxy,
         timeout=opts.timeout,
+        verify_ssl=opts.verify_ssl,
+        delay=opts.delay,
       )
       partial.requests_sent += 1
 
@@ -273,6 +292,17 @@ def _scan_endpoint(
         if diff.verdict == DiffVerdict.CONFIRMED:
           break
 
+      # 4b. Blind IDOR check — runs on every candidate, regardless of diff verdict
+      if opts.blind_idor:
+        blind = _check_blind_idor(
+          ref, baseline, tamper_result.fingerprint,
+          cand.value, cand.description,
+        )
+        if blind:
+          partial.findings.append(blind)
+          log(f"[+] BLIND IDOR — {ref.param}={cand.value!r} @ {url}")
+          break  # one blind finding per ref is enough
+
     # 4. Method bypass check
     if opts.method_bypass:
       method_results = send_method_variants(
@@ -281,6 +311,8 @@ def _scan_endpoint(
         cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
         proxy=opts.proxy,
         timeout=opts.timeout,
+        verify_ssl=opts.verify_ssl,
+        delay=opts.delay,
       )
       partial.requests_sent += len(method_results)
       for mr in method_results:
@@ -315,6 +347,8 @@ def _scan_endpoint(
         cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
         proxy=opts.proxy,
         timeout=opts.timeout,
+        verify_ssl=opts.verify_ssl,
+        delay=opts.delay,
       )
       partial.requests_sent += 1
       if pp_result:
@@ -339,6 +373,29 @@ def _scan_endpoint(
             notes="HTTP parameter pollution",
           ))
 
+    # 6. Mass assignment check
+    if opts.mass_assignment:
+      # Use first foreign ID if available, otherwise first candidate value
+      foreign_id = (
+        list(known_foreign.values())[0] if known_foreign
+        else (candidates[0].value if candidates else "")
+      )
+      ma_finding = _check_mass_assignment(
+        ref, baseline, foreign_id, opts, pair,
+      )
+      if ma_finding:
+        partial.requests_sent += 1
+        partial.findings.append(ma_finding)
+        log(f"[+] MASS ASSIGNMENT — {ref.param} @ {url}")
+
+    # 7. Soft-delete check
+    if opts.soft_delete:
+      sd_finding = _check_soft_delete(ref, baseline, opts, pair)
+      if sd_finding:
+        partial.requests_sent += len(_SOFT_DELETE_HINTS)
+        partial.findings.append(sd_finding)
+        log(f"[+] SOFT-DELETE BYPASS — {ref.param} @ {url}")
+
   return partial
 
 
@@ -347,16 +404,15 @@ def _scan_endpoint(
 # ---------------------------------------------------------------------------
 
 def _build_session_pair(opts: ScanOptions) -> SessionPair:
-  from .session import Session, SessionPair
+  from .session import Session
   session_a = Session(
     label=opts.session_a_label,
     headers=opts.session_a_headers,
     cookies=opts.session_a_cookies,
   )
-  session_b: Optional[SessionPair] = None
+  session_b: Optional[Session] = None
   if opts.session_b_label:
-    from .session import Session as _S
-    session_b = _S(
+    session_b = Session(
       label=opts.session_b_label,
       headers=opts.session_b_headers,
       cookies=opts.session_b_cookies,
@@ -375,3 +431,264 @@ def _classify_idor_type(
   if is_dual:
     return IDORType.VERTICAL
   return IDORType.HORIZONTAL
+
+
+# ---------------------------------------------------------------------------
+# Mass-assignment check
+# ---------------------------------------------------------------------------
+
+# Ownership field names we try to inject
+_MA_FIELDS = [
+  "user_id", "owner_id", "account_id", "userId", "ownerId", "accountId",
+  "created_by", "createdBy", "author_id", "authorId",
+]
+
+def _check_mass_assignment(
+  ref:        ObjectRef,
+  baseline:   ResponseFingerprint,
+  foreign_id: str,
+  opts:       "ScanOptions",
+  pair:       "SessionPair",
+) -> Optional[IDORFinding]:
+  """
+  Inject ownership fields into a JSON body and check whether the server
+  accepts/reflects them back.  Only meaningful for JSON body requests.
+  """
+  if ref.location not in (IDORLocation.JSON_BODY, IDORLocation.POST_BODY):
+    return None
+  if not foreign_id:
+    return None
+
+  # Build an injected body
+  if ref.location == IDORLocation.JSON_BODY and isinstance(ref.body_context, dict):
+    injected = dict(ref.body_context)
+  else:
+    injected = {}
+
+  # Add all ownership field candidates with the foreign ID
+  for f in _MA_FIELDS:
+    injected[f] = foreign_id
+
+  body_str = _json.dumps(injected)
+
+  req_headers = dict(pair.headers_for('a'))
+  req_headers.setdefault('Content-Type', 'application/json')
+  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
+  if pair.cookies_for('a'):
+    req_headers.setdefault('Cookie', pair.cookies_for('a'))
+
+  fp = _do_single_request(
+    ref.url, ref.method, req_headers, body_str,
+    opts.proxy, opts.timeout, opts.verify_ssl, opts.delay,
+  )
+  if fp is None:
+    return None
+
+  diff = compare(baseline, fp, None)
+
+  # Signal: server reflected one of the injected ownership fields in its response
+  if diff.verdict not in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY, DiffVerdict.POSSIBLE):
+    return None
+
+  # Stronger signal: the injected foreign_id actually shows up in the response
+  injected_reflected = foreign_id in fp.body
+
+  confidence = diff.confidence
+  if injected_reflected and confidence not in (Confidence.CONFIRMED, Confidence.HIGH):
+    confidence = Confidence.HIGH
+
+  return IDORFinding(
+    idor_type=IDORType.MASS_ASSIGNMENT,
+    confidence=confidence,
+    location=ref.location,
+    url=ref.url,
+    method=ref.method,
+    parameter=", ".join(_MA_FIELDS[:4]) + " ...",
+    id_type=ref.id_type,
+    original_value=ref.value,
+    tampered_value=foreign_id,
+    baseline_status=baseline.status,
+    tampered_status=fp.status,
+    baseline_length=baseline.body_length,
+    tampered_length=fp.body_length,
+    owner_fields_leaked=diff.leaked_fields,
+    evidence_snippet=diff.evidence_snippet,
+    notes="mass assignment: injected ownership field accepted" + (
+      "; injected value reflected in response" if injected_reflected else ""
+    ),
+  )
+
+
+# ---------------------------------------------------------------------------
+# Soft-delete check
+# ---------------------------------------------------------------------------
+
+# Query params that may reveal soft-deleted resources
+_SOFT_DELETE_HINTS: List[tuple[str, str]] = [
+  ("include_deleted", "true"),
+  ("show_deleted",    "1"),
+  ("deleted",         "true"),
+  ("status",          "deleted"),
+  ("archived",        "true"),
+  ("include_archived","true"),
+  ("with_trashed",    "1"),
+]
+
+def _check_soft_delete(
+  ref:      ObjectRef,
+  baseline: ResponseFingerprint,
+  opts:     "ScanOptions",
+  pair:     "SessionPair",
+) -> Optional[IDORFinding]:
+  """
+  When a tampered request returns 404 (resource not found / deleted), retry
+  with soft-delete hint parameters to see if the resource is still accessible.
+  """
+  import urllib.parse as _up
+
+  req_headers = dict(pair.headers_for('a'))
+  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
+  if pair.cookies_for('a'):
+    req_headers.setdefault('Cookie', pair.cookies_for('a'))
+
+  for param, value in _SOFT_DELETE_HINTS:
+    parsed  = _up.urlparse(ref.url)
+    qs      = _up.parse_qsl(parsed.query, keep_blank_values=True)
+    qs.append((param, value))
+    hinted_url = _up.urlunparse(parsed._replace(query=_up.urlencode(qs)))
+
+    fp = _do_single_request(
+      hinted_url, ref.method, req_headers, "",
+      opts.proxy, opts.timeout, opts.verify_ssl, opts.delay,
+    )
+    if fp is None:
+      continue
+
+    # Positive signal: 404 baseline but 200 with the hint param
+    if baseline.status == 404 and fp.status == 200 and fp.body_length > 50:
+      return IDORFinding(
+        idor_type=IDORType.SOFT_DELETE,
+        confidence=Confidence.HIGH,
+        location=IDORLocation.QUERY_PARAM,
+        url=ref.url,
+        method=ref.method,
+        parameter=param,
+        id_type=ref.id_type,
+        original_value=ref.value,
+        tampered_value=value,
+        baseline_status=baseline.status,
+        tampered_status=fp.status,
+        baseline_length=baseline.body_length,
+        tampered_length=fp.body_length,
+        owner_fields_leaked=[],
+        evidence_snippet=fp.body[:500],
+        notes=f"soft-delete bypass: {param}={value} reveals deleted resource",
+      )
+
+    # Weaker signal: same-family success, body grew significantly
+    if fp.status == 200 and baseline.status == 200:
+      growth = (fp.body_length - baseline.body_length) / max(baseline.body_length, 1)
+      if growth > 0.3 and fp.stable_hash != baseline.stable_hash:
+        return IDORFinding(
+          idor_type=IDORType.SOFT_DELETE,
+          confidence=Confidence.MEDIUM,
+          location=IDORLocation.QUERY_PARAM,
+          url=ref.url,
+          method=ref.method,
+          parameter=param,
+          id_type=ref.id_type,
+          original_value=ref.value,
+          tampered_value=value,
+          baseline_status=baseline.status,
+          tampered_status=fp.status,
+          baseline_length=baseline.body_length,
+          tampered_length=fp.body_length,
+          owner_fields_leaked=[],
+          evidence_snippet=fp.body[:500],
+          notes=f"soft-delete bypass: {param}={value} returns extra content",
+        )
+
+  return None
+
+
+# ---------------------------------------------------------------------------
+# Blind IDOR check
+# ---------------------------------------------------------------------------
+
+def _check_blind_idor(
+  ref:            ObjectRef,
+  baseline:       ResponseFingerprint,
+  tamper_fp:      ResponseFingerprint,
+  tampered_value: str,
+  description:    str,
+) -> Optional[IDORFinding]:
+  """
+  Detect blind IDOR: the tampered request produced a meaningful status-code
+  change (suggesting access to a resource) but returned no body content,
+  so a normal comparator diff would score low.
+
+  Signals:
+    - Baseline returned 403/404/405; tampered returned 200/201/202/204
+    - Tampered body is empty or very short (< 100 bytes) — no data leaked
+  """
+  _DENY_CODES  = {403, 404, 405, 401}
+  _ACCESS_CODES = {200, 201, 202, 204}
+
+  if baseline.status not in _DENY_CODES:
+    return None
+  if tamper_fp.status not in _ACCESS_CODES:
+    return None
+  # If there IS substantial body content, the normal comparator handles it
+  if tamper_fp.body_length > 100:
+    return None
+
+  return IDORFinding(
+    idor_type=IDORType.BLIND,
+    confidence=Confidence.MEDIUM,
+    location=ref.location,
+    url=ref.url,
+    method=ref.method,
+    parameter=ref.param,
+    id_type=ref.id_type,
+    original_value=ref.value,
+    tampered_value=tampered_value,
+    baseline_status=baseline.status,
+    tampered_status=tamper_fp.status,
+    baseline_length=baseline.body_length,
+    tampered_length=tamper_fp.body_length,
+    owner_fields_leaked=[],
+    evidence_snippet=tamper_fp.body[:500],
+    notes=(
+      f"blind IDOR: status {baseline.status} → {tamper_fp.status} "
+      f"with no response body; side-effect may have occurred. {description}"
+    ),
+  )
+
+
+# ---------------------------------------------------------------------------
+# Shared single-request helper (used by mass-assignment + soft-delete)
+# ---------------------------------------------------------------------------
+
+def _do_single_request(
+  url:        str,
+  method:     str,
+  headers:    Dict[str, str],
+  body:       str,
+  proxy:      str,
+  timeout:    int,
+  verify_ssl: bool,
+  delay:      float,
+) -> Optional[ResponseFingerprint]:
+  from .tamper import _do_request as _tamper_do_request
+  if delay > 0:
+    time.sleep(delay)
+  return _tamper_do_request(
+    url=url,
+    method=method,
+    headers=headers,
+    body=body,
+    proxy=proxy,
+    timeout=timeout,
+    verify_ssl=verify_ssl,
+    _retries=0,
+  )

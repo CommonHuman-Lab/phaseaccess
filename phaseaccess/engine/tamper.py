@@ -18,7 +18,10 @@ Standalone-safe: stdlib only.
 from __future__ import annotations
 
 import json
+import logging
+import ssl
 import time
+import urllib.error
 import urllib.parse as up
 import urllib.request as _req
 from dataclasses import dataclass
@@ -27,6 +30,8 @@ from typing import Any, Dict, List, Optional
 from .reporter import IDORLocation
 from .extractor import ObjectRef
 from .fingerprint import ResponseFingerprint, fingerprint_response
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +58,8 @@ def send_tampered(
   cookies:        str = "",
   proxy:          str = "",
   timeout:        int = 15,
+  verify_ssl:     bool = True,
+  delay:          float = 0.0,
 ) -> Optional[TamperResult]:
   """
   Re-issue `ref.url` with `tampered_value` substituted for `ref.value`
@@ -60,10 +67,17 @@ def send_tampered(
   """
   try:
     url, headers, body = _build_request(ref, tampered_value, extra_headers or {}, cookies)
-  except Exception:
+  except Exception as exc:
+    logger.debug(
+      "Failed to build tampered request for %s param=%s value=%r: %s",
+      ref.url, ref.param, tampered_value, exc,
+    )
     return None
 
-  fp = _do_request(url, ref.method, headers, body, proxy, timeout)
+  if delay > 0:
+    time.sleep(delay)
+
+  fp = _do_request(url, ref.method, headers, body, proxy, timeout, verify_ssl=verify_ssl)
   if fp is None:
     return None
 
@@ -81,6 +95,8 @@ def send_method_variants(
   cookies:        str = "",
   proxy:          str = "",
   timeout:        int = 15,
+  verify_ssl:     bool = True,
+  delay:          float = 0.0,
 ) -> List[TamperResult]:
   """
   Try alternative HTTP methods on the same endpoint with the *original* value.
@@ -100,8 +116,11 @@ def send_method_variants(
       body_context=ref.body_context,
       header_name=ref.header_name,
     )
+    if delay > 0:
+      time.sleep(delay)
     fp = _do_request(
-      ref.url, method, dict(extra_headers or {}), "", proxy, timeout
+      ref.url, method, dict(extra_headers or {}), "", proxy, timeout,
+      verify_ssl=verify_ssl,
     )
     if fp:
       results.append(TamperResult(
@@ -120,6 +139,8 @@ def send_param_pollution(
   cookies:        str = "",
   proxy:          str = "",
   timeout:        int = 15,
+  verify_ssl:     bool = True,
+  delay:          float = 0.0,
 ) -> Optional[TamperResult]:
   """
   Duplicate a query param — ?id=own&id=victim — to detect server-side
@@ -134,7 +155,10 @@ def send_param_pollution(
   qs_pairs.append((ref.param, tampered_value))
   new_url = up.urlunparse(parsed._replace(query=up.urlencode(qs_pairs)))
 
-  fp = _do_request(new_url, ref.method, dict(extra_headers or {}), "", proxy, timeout)
+  if delay > 0:
+    time.sleep(delay)
+  fp = _do_request(new_url, ref.method, dict(extra_headers or {}), "", proxy, timeout,
+                   verify_ssl=verify_ssl)
   if fp is None:
     return None
 
@@ -218,40 +242,82 @@ def _build_request(
 # ---------------------------------------------------------------------------
 
 def _do_request(
-  url:     str,
-  method:  str,
-  headers: Dict[str, str],
-  body:    str,
-  proxy:   str,
-  timeout: int,
+  url:        str,
+  method:     str,
+  headers:    Dict[str, str],
+  body:       str,
+  proxy:      str,
+  timeout:    int,
+  verify_ssl: bool = True,
+  _retries:   int = 2,
 ) -> Optional[ResponseFingerprint]:
-  try:
-    body_bytes = body.encode() if body else None
-    req = _req.Request(url, data=body_bytes, headers=headers, method=method)
+  body_bytes = body.encode() if body else None
+  req = _req.Request(url, data=body_bytes, headers=headers, method=method)
 
-    handler_chain: list = []
-    if proxy:
-      handler_chain.append(_req.ProxyHandler({'http': proxy, 'https': proxy}))
-    handler_chain.append(_req.HTTPCookieProcessor())
-    opener = _req.build_opener(*handler_chain)
+  handler_chain: list = []
+  if proxy:
+    handler_chain.append(_req.ProxyHandler({'http': proxy, 'https': proxy}))
+  if not verify_ssl:
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    handler_chain.append(_req.HTTPSHandler(context=ssl_ctx))
+  handler_chain.append(_req.HTTPCookieProcessor())
+  opener = _req.build_opener(*handler_chain)
 
+  for attempt in range(1 + _retries):
     t0 = time.time()
-    with opener.open(req, timeout=timeout) as resp:
-      elapsed_ms = (time.time() - t0) * 1000
-      resp_body  = resp.read().decode('utf-8', errors='replace')
-      resp_headers: Dict[str, str] = dict(resp.headers)
-      status = resp.status
+    try:
+      with opener.open(req, timeout=timeout) as resp:
+        elapsed_ms = (time.time() - t0) * 1000
+        resp_body  = resp.read().decode('utf-8', errors='replace')
+        resp_headers: Dict[str, str] = dict(resp.headers)
+        status = resp.status
 
-    return fingerprint_response(
-      url=url,
-      method=method,
-      status=status,
-      body=resp_body,
-      headers=resp_headers,
-      elapsed_ms=elapsed_ms,
-    )
-  except Exception:
-    return None
+      return fingerprint_response(
+        url=url,
+        method=method,
+        status=status,
+        body=resp_body,
+        headers=resp_headers,
+        elapsed_ms=elapsed_ms,
+      )
+
+    except urllib.error.HTTPError as exc:
+      # Rate-limited — back off and retry
+      if exc.code == 429 and attempt < _retries:
+        retry_after = int(exc.headers.get('Retry-After', '2'))
+        logger.debug("Rate limited on %s — backing off %ds", url, retry_after)
+        time.sleep(min(retry_after, 30))
+        continue
+      # All other HTTP errors: still a valid fingerprint-able response
+      try:
+        elapsed_ms = (time.time() - t0) * 1000
+        resp_body  = exc.read().decode('utf-8', errors='replace')
+        resp_headers = dict(exc.headers)
+        return fingerprint_response(
+          url=url,
+          method=method,
+          status=exc.code,
+          body=resp_body,
+          headers=resp_headers,
+          elapsed_ms=elapsed_ms,
+        )
+      except Exception as inner:
+        logger.debug("Failed to read HTTPError body for %s: %s", url, inner)
+        return None
+
+    except urllib.error.URLError as exc:
+      logger.debug("Network error on tampered request %s: %s", url, exc.reason)
+      return None
+    except ssl.SSLError as exc:
+      logger.debug("SSL error on tampered request %s: %s", url, exc)
+      return None
+    except Exception as exc:
+      logger.debug("Unexpected error on tampered request %s: %s", url, exc)
+      return None
+
+  return None  # exhausted retries
 
 
 # ---------------------------------------------------------------------------

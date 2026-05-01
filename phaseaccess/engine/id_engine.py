@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import logging
 import re
 import struct
 import time
@@ -21,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .reporter import IDType
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +109,8 @@ def _is_snowflake(v: str) -> bool:
     ts_ms = (n >> 22) + 1288834974657
     year = time.gmtime(ts_ms / 1000).tm_year
     return 2010 <= year <= 2040
-  except Exception:
+  except Exception as exc:
+    logger.debug("Snowflake check failed for %r: %s", v, exc)
     return False
 
 
@@ -118,7 +122,8 @@ def _is_valid_base64(v: str) -> bool:
     decoded = base64.b64decode(padded)
     # Must decode to something non-trivial (not all zeros, min 4 bytes)
     return len(decoded) >= 4 and not all(b == 0 for b in decoded)
-  except Exception:
+  except Exception as exc:
+    logger.debug("Base64 validation failed for %r: %s", v, exc)
     return False
 
 
@@ -249,8 +254,8 @@ def _uuid_candidates(value: str, id_type: IDType, count: int) -> List[TamperCand
         )
         new_uuid = str(uuid.UUID(int=new_int))
         results.append(TamperCandidate(new_uuid, f"UUID v1 timestamp delta {delta:+d}"))
-    except Exception:
-      pass
+    except Exception as exc:
+      logger.debug("UUID v1 candidate generation failed for %r: %s", value, exc)
 
   # For all UUID types: generate random v4s (tests whether format is validated)
   for i in range(min(3, count)):
@@ -295,8 +300,8 @@ def _base64_candidates(value: str) -> List[TamperCandidate]:
       enc = base64.b64encode(prefix.encode()).decode().rstrip('=')
       results.append(TamperCandidate(enc, f"Base64({prefix!r})"))
 
-  except Exception:
-    pass
+  except Exception as exc:
+    logger.debug("Base64 candidate generation failed for %r: %s", value, exc)
   return results
 
 
@@ -326,7 +331,8 @@ def _jwt_candidates(value: str) -> List[TamperCandidate]:
     payload_raw = _b64_decode(parts[1])
     header  = _json.loads(header_raw)
     payload = _json.loads(payload_raw)
-  except Exception:
+  except Exception as exc:
+    logger.debug("JWT candidate generation failed for token: %s", exc)
     return results
 
   # 1. None algorithm — stripped signature

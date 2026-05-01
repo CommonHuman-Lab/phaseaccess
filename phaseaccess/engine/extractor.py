@@ -17,6 +17,7 @@ Standalone-safe: stdlib only.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import urllib.parse as up
 from dataclasses import dataclass, field
@@ -24,6 +25,9 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .reporter import IDORLocation, IDType
 from .id_engine import detect_id_type
+from ._constants import OWNERSHIP_KEYS
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -73,13 +77,7 @@ _ID_HEADERS = {
 }
 
 # JSON response keys that indicate object ownership
-_OWNERSHIP_KEYS = {
-  'user_id', 'userid', 'userId', 'owner_id', 'ownerId', 'owner',
-  'account_id', 'accountId', 'created_by', 'createdBy',
-  'author_id', 'authorId', 'author',
-  'email', 'username', 'handle', 'phone',
-  'assigned_to', 'assignedTo',
-}
+_OWNERSHIP_KEYS = OWNERSHIP_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +227,10 @@ def harvest_ids_from_response(url: str, body: str) -> List[HarvestedID]:
             value=str(value),
             url=url,
           ))
-  except Exception:
-    pass
+  except json.JSONDecodeError as exc:
+    logger.debug("JSON parse error harvesting IDs from %s: %s", url, exc)
+  except Exception as exc:
+    logger.debug("Unexpected error harvesting IDs from %s: %s", url, exc)
   return harvested
 
 

@@ -7,7 +7,7 @@ name = "phaseaccess"
 version = "0.1.0"
 description = "Native IDOR and broken object-level authorization detection engine"
 readme = "README.md"
-license = { text = "AGPL3" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.10"
 authors = [
   { name = "CommonHuman-Lab" },
@@ -17,7 +17,7 @@ classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Information Technology",
-  "License :: OSI Approved :: AGPL3 License",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -28,6 +28,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
 [project.scripts]
 phaseaccess = "phaseaccess.__main__:main"
 
@@ -37,3 +40,13 @@ Issues   = "https://github.com/commonhuman-lab/phaseaccess/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["phaseaccess"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["phaseaccess"]
+omit = ["phaseaccess/__main__.py"]

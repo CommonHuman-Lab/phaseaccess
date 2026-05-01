@@ -13,12 +13,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import ssl
 import time
+import urllib.error
 import urllib.request as _req
 import urllib.parse as up
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+from ._constants import OWNERSHIP_KEYS
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +141,8 @@ def build_baseline(
   proxy:       str      = "",
   timeout:     int      = 15,
   repeats:     int      = 2,
+  verify_ssl:  bool     = True,
+  delay:       float    = 0.0,
 ) -> Optional[ResponseFingerprint]:
   """
   Fetch the URL `repeats` times with the *owner's* credentials and return
@@ -143,12 +152,16 @@ def build_baseline(
   """
   fps: List[ResponseFingerprint] = []
   for _ in range(repeats):
-    fp = _fetch_fingerprint(url, method, headers or {}, body, cookies, proxy, timeout)
+    fp = _fetch_fingerprint(
+      url, method, headers or {}, body, cookies, proxy, timeout,
+      verify_ssl=verify_ssl,
+    )
     if fp:
       fps.append(fp)
-    time.sleep(0.1)
+    _sleep(delay if delay > 0 else 0.1)
 
   if not fps:
+    logger.warning("Baseline fetch failed for %s", url)
     return None
 
   # Return the first; caller uses comparator to diff against tampered responses
@@ -156,42 +169,48 @@ def build_baseline(
 
 
 def _fetch_fingerprint(
-  url:     str,
-  method:  str,
-  headers: Dict[str, str],
-  body:    str,
-  cookies: str,
-  proxy:   str,
-  timeout: int,
+  url:        str,
+  method:     str,
+  headers:    Dict[str, str],
+  body:       str,
+  cookies:    str,
+  proxy:      str,
+  timeout:    int,
+  verify_ssl: bool = True,
 ) -> Optional[ResponseFingerprint]:
   """Make a single HTTP request and return a fingerprint."""
+  req_headers = dict(headers)
+  if cookies:
+    req_headers.setdefault('Cookie', cookies)
+  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
+
+  body_bytes = body.encode() if body else None
+
+  request = _req.Request(
+    url,
+    data=body_bytes,
+    headers=req_headers,
+    method=method,
+  )
+
+  handler_chain: list = []
+  if proxy:
+    proxy_handler = _req.ProxyHandler({
+      'http':  proxy,
+      'https': proxy,
+    })
+    handler_chain.append(proxy_handler)
+  if not verify_ssl:
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    handler_chain.append(_req.HTTPSHandler(context=ssl_ctx))
+  handler_chain.append(_req.HTTPCookieProcessor())
+
+  opener = _req.build_opener(*handler_chain)
+
+  t0 = time.time()
   try:
-    req_headers = dict(headers)
-    if cookies:
-      req_headers.setdefault('Cookie', cookies)
-    req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
-
-    body_bytes = body.encode() if body else None
-
-    request = _req.Request(
-      url,
-      data=body_bytes,
-      headers=req_headers,
-      method=method,
-    )
-
-    handler_chain: list = []
-    if proxy:
-      proxy_handler = _req.ProxyHandler({
-        'http':  proxy,
-        'https': proxy,
-      })
-      handler_chain.append(proxy_handler)
-    handler_chain.append(_req.HTTPCookieProcessor())
-
-    opener = _req.build_opener(*handler_chain)
-
-    t0 = time.time()
     with opener.open(request, timeout=timeout) as resp:
       elapsed_ms = (time.time() - t0) * 1000
       resp_body  = resp.read().decode('utf-8', errors='replace')
@@ -207,7 +226,33 @@ def _fetch_fingerprint(
       elapsed_ms=elapsed_ms,
     )
 
-  except Exception:
+  except urllib.error.HTTPError as exc:
+    # HTTP errors (4xx/5xx) are still valid fingerprint-able responses
+    try:
+      elapsed_ms = (time.time() - t0) * 1000
+      resp_body  = exc.read().decode('utf-8', errors='replace')
+      resp_headers = dict(exc.headers)
+      return fingerprint_response(
+        url=url,
+        method=method,
+        status=exc.code,
+        body=resp_body,
+        headers=resp_headers,
+        elapsed_ms=elapsed_ms,
+      )
+    except Exception as inner:
+      logger.debug("Failed to read HTTPError body for %s: %s", url, inner)
+      return None
+  except urllib.error.URLError as exc:
+    logger.warning("Network error fetching %s: %s", url, exc.reason)
+    return None
+  except ssl.SSLError as exc:
+    logger.warning(
+      "SSL error fetching %s: %s  (use --insecure to skip verification)", url, exc
+    )
+    return None
+  except Exception as exc:
+    logger.debug("Unexpected error fetching %s: %s", url, exc)
     return None
 
 
@@ -215,14 +260,9 @@ def _fetch_fingerprint(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-# Ownership fields we specifically track for cross-user evidence
-_OWNERSHIP_KEYS = {
-  'user_id', 'userid', 'userId', 'owner_id', 'ownerId', 'owner',
-  'account_id', 'accountId', 'created_by', 'createdBy',
-  'author_id', 'authorId', 'author',
-  'email', 'username', 'handle', 'phone',
-  'assigned_to', 'assignedTo', 'name', 'full_name', 'fullName',
-}
+def _sleep(seconds: float) -> None:
+  if seconds > 0:
+    time.sleep(seconds)
 
 
 def _stabilise(body: str) -> str:
@@ -256,7 +296,8 @@ def _analyse_json(
 
   try:
     parsed = json.loads(body)
-  except Exception:
+  except json.JSONDecodeError as exc:
+    logger.debug("JSON parse error in response body: %s", exc)
     return keys, ownership, sig
 
   if isinstance(parsed, dict):
@@ -304,7 +345,7 @@ def _extract_ownership(
   if depth > 4 or not isinstance(obj, dict):
     return
   for k, v in obj.items():
-    if k.lower() in {ow.lower() for ow in _OWNERSHIP_KEYS}:
+    if k.lower() in {ow.lower() for ow in OWNERSHIP_KEYS}:
       if v is not None and str(v) not in ('', 'null', 'None'):
         out[k] = str(v)
     elif isinstance(v, dict):
