@@ -20,19 +20,20 @@ Standalone-safe: stdlib only.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
-import ssl
 import time
 import urllib.error
 import urllib.parse as up
 import urllib.request as _req
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .reporter import IDORLocation
 from .extractor import ObjectRef
 from .fingerprint import ResponseFingerprint, fingerprint_response
+from .http_client import get_opener
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ class TamperResult:
   fingerprint:      ResponseFingerprint
   # Effective request details (for curl reproduction)
   effective_url:    str = ""
-  effective_headers: Dict[str, str] = None  # type: ignore
+  effective_headers: Optional[Dict[str, str]] = field(default=None)
   effective_body:   str = ""
 
   def __post_init__(self) -> None:
@@ -89,7 +90,7 @@ def send_tampered(
   if delay > 0:
     time.sleep(delay)
 
-  fp = _do_request(url, ref.method, headers, body, proxy, timeout,
+  fp = fire_request(url, ref.method, headers, body, proxy, timeout,
                    verify_ssl=verify_ssl, baseline_body=baseline_body)
   if fp is None:
     return None
@@ -134,7 +135,7 @@ def send_method_variants(
     )
     if delay > 0:
       time.sleep(delay)
-    fp = _do_request(
+    fp = fire_request(
       ref.url, method, dict(extra_headers or {}), "", proxy, timeout,
       verify_ssl=verify_ssl,
     )
@@ -173,7 +174,7 @@ def send_param_pollution(
 
   if delay > 0:
     time.sleep(delay)
-  fp = _do_request(new_url, ref.method, dict(extra_headers or {}), "", proxy, timeout,
+  fp = fire_request(new_url, ref.method, dict(extra_headers or {}), "", proxy, timeout,
                    verify_ssl=verify_ssl)
   if fp is None:
     return None
@@ -226,7 +227,7 @@ def _build_request(
     headers['Content-Type'] = 'application/x-www-form-urlencoded'
 
   elif loc == IDORLocation.JSON_BODY:
-    ctx = dict(ref.body_context) if isinstance(ref.body_context, dict) else {}
+    ctx = copy.deepcopy(ref.body_context) if isinstance(ref.body_context, dict) else {}
     _set_nested(ctx, ref.param, tampered)
     body = json.dumps(ctx)
     headers['Content-Type'] = 'application/json'
@@ -255,7 +256,7 @@ def _build_request(
 # HTTP layer
 # ---------------------------------------------------------------------------
 
-def _do_request(
+def fire_request(
   url:           str,
   method:        str,
   headers:       Dict[str, str],
@@ -268,17 +269,7 @@ def _do_request(
 ) -> Optional[ResponseFingerprint]:
   body_bytes = body.encode() if body else None
   req = _req.Request(url, data=body_bytes, headers=headers, method=method)
-
-  handler_chain: list = []
-  if proxy:
-    handler_chain.append(_req.ProxyHandler({'http': proxy, 'https': proxy}))
-  if not verify_ssl:
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    handler_chain.append(_req.HTTPSHandler(context=ssl_ctx))
-  handler_chain.append(_req.HTTPCookieProcessor())
-  opener = _req.build_opener(*handler_chain)
+  opener = get_opener(proxy, verify_ssl)
 
   for attempt in range(1 + _retries):
     t0 = time.time()

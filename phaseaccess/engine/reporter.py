@@ -53,6 +53,17 @@ class Confidence(str, Enum):
   INFO        = "info"         # ID enumeration possible but no access confirmed
 
 
+# Canonical confidence ranking (lower index = higher severity).
+# Shared between scanner, CLI, and any programmatic consumer.
+CONFIDENCE_RANK: Dict[str, int] = {
+  Confidence.CONFIRMED: 0,
+  Confidence.HIGH:      1,
+  Confidence.MEDIUM:    2,
+  Confidence.LOW:       3,
+  Confidence.INFO:      4,
+}
+
+
 class IDORLocation(str, Enum):
   QUERY_PARAM   = "query_param"
   PATH_SEGMENT  = "path_segment"
@@ -164,7 +175,8 @@ class ScanResult:
 
   @property
   def success(self) -> bool:
-    return not bool(self.errors) or bool(self.findings)
+    """True only when the scan completed without any errors."""
+    return not bool(self.errors)
 
   @property
   def total_findings(self) -> int:

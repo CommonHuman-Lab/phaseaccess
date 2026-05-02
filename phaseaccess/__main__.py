@@ -48,16 +48,17 @@ import json
 import logging
 import os
 import sys
+from typing import Any
 
 try:
   from phaseaccess.engine import scan, ScanOptions
-  from phaseaccess.engine.reporter import Confidence
+  from phaseaccess.engine.reporter import Confidence, CONFIDENCE_RANK
 except ImportError:
   _HERE = os.path.dirname(os.path.abspath(__file__))
   if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
   from engine import scan, ScanOptions
-  from engine.reporter import Confidence
+  from engine.reporter import Confidence, CONFIDENCE_RANK
 
 # ---------------------------------------------------------------------------
 # ANSI colours
@@ -98,6 +99,11 @@ def _validate_url(url: str) -> str:
   if not url.startswith(("http://", "https://")):
     return "URL must start with http:// or https://"
   return ""
+
+
+def _validate_extra_url(url: str) -> str:
+  """Validate an extra/imported URL — same rules as primary URL."""
+  return _validate_url(url)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +228,9 @@ def interactive_prompts() -> argparse.Namespace:
   max_cand_str    = _prompt("  Candidates/param", default="10")
   method_bypass   = _prompt_bool("  Test method bypass",     default=True)
   param_pollution = _prompt_bool("  Test param pollution",   default=True)
+  mass_assignment = _prompt_bool("  Test mass assignment",   default=True)
+  soft_delete     = _prompt_bool("  Test soft-delete bypass", default=True)
+  blind_idor      = _prompt_bool("  Test blind IDOR",        default=True)
   output          = _prompt("  Save report to file", hint="blank = stdout only")
 
   print()
@@ -245,9 +254,9 @@ def interactive_prompts() -> argparse.Namespace:
     max_candidates=_safe_int(max_cand_str, 10, 1, 50),
     no_method_bypass=not method_bypass,
     no_param_pollution=not param_pollution,
-    no_mass_assignment=False,
-    no_soft_delete=False,
-    no_blind_idor=False,
+    no_mass_assignment=not mass_assignment,
+    no_soft_delete=not soft_delete,
+    no_blind_idor=not blind_idor,
     json_output=False,
     quiet=False,
     verbose=False,
@@ -284,8 +293,10 @@ def build_parser() -> argparse.ArgumentParser:
                  help="Disable SSL certificate verification")
   p.add_argument("--delay",          type=float, default=0.0,
                  help="Seconds between requests (default 0)")
-  p.add_argument("-t", "--threads",  type=int, default=5)
-  p.add_argument("--timeout",        type=int, default=15)
+  p.add_argument("-t", "--threads",  type=int, default=5,
+                 help="Threads (default 5, min 1, max 50)")
+  p.add_argument("--timeout",        type=int, default=15,
+                 help="Request timeout in seconds (default 15, min 1, max 300)")
   p.add_argument("--max-candidates", type=int, default=10)
   p.add_argument("--targets",        default="",
                  help="Import targets from HAR / Burp XML / JSON file")
@@ -337,6 +348,20 @@ def main() -> None:
       print(YELLOW(f"[!] {err}"), file=sys.stderr)
       sys.exit(2)
 
+  # Validate --threads and --timeout ranges
+  if args.threads < 1:
+    print(YELLOW("[!] --threads must be at least 1"), file=sys.stderr)
+    sys.exit(2)
+  if args.threads > 50:
+    print(YELLOW("[!] --threads must be at most 50"), file=sys.stderr)
+    sys.exit(2)
+  if args.timeout < 1:
+    print(YELLOW("[!] --timeout must be at least 1 second"), file=sys.stderr)
+    sys.exit(2)
+  if args.timeout > 300:
+    print(YELLOW("[!] --timeout must be at most 300 seconds"), file=sys.stderr)
+    sys.exit(2)
+
   # No URL supplied → interactive mode
   if not args.url:
     args = interactive_prompts()
@@ -356,12 +381,21 @@ def main() -> None:
     imported_targets = _load_import(args.targets)
     for t in imported_targets:
       u = t.get('url', '')
-      if u and u not in imported_extra_urls:
+      if u and not _validate_extra_url(u) and u not in imported_extra_urls:
         imported_extra_urls.append(u)
     if not args.quiet and not args.json_output:
       print(DIM(f"[*] Imported {len(imported_extra_urls)} URL(s) from {args.targets}"))
 
-  combined_extra_urls = list(args.extra_url) + imported_extra_urls
+  # Validate --extra-url values
+  validated_extra_urls: list[str] = []
+  for u in args.extra_url:
+    err = _validate_extra_url(u)
+    if err:
+      print(YELLOW(f"[!] Extra URL {u!r} skipped: {err}"), file=sys.stderr)
+    else:
+      validated_extra_urls.append(u)
+
+  combined_extra_urls = validated_extra_urls + imported_extra_urls
 
   def live_log(msg: str) -> None:
     if args.quiet or args.json_output:
@@ -416,12 +450,11 @@ def main() -> None:
 
   # Apply --min-confidence filter
   min_conf = getattr(args, 'min_confidence', '').lower().strip()
-  _CONF_RANK = {'confirmed': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
-  if min_conf and min_conf in _CONF_RANK:
-    threshold = _CONF_RANK[min_conf]
+  if min_conf and min_conf in CONFIDENCE_RANK:
+    threshold = CONFIDENCE_RANK[min_conf]
     result.findings = [
       f for f in result.findings
-      if _CONF_RANK.get(f.confidence.lower(), 99) <= threshold
+      if CONFIDENCE_RANK.get(f.confidence.lower(), 99) <= threshold
     ]
 
   if args.json_output:
@@ -452,7 +485,7 @@ def _write_output(path: str, text: str) -> None:
     print(YELLOW(f"[!] Could not write output to {path}: {exc}"), file=sys.stderr)
 
 
-def _format_human(result: any, mode: str) -> list[str]:
+def _format_human(result: Any, mode: str) -> list[str]:
   lines = []
   lines.append(BOLD("=" * 65))
   lines.append(BOLD("  PhaseAccess — Scan Summary"))

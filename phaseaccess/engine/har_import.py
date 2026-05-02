@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import urllib.parse as up
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
@@ -144,7 +145,6 @@ def _parse_har_request(req: Dict[str, Any]) -> Optional[ScanTarget]:
     body = post_data.get('text', '') or ''
     # Some HAR exporters encode the body in params list
     if not body and post_data.get('params'):
-      import urllib.parse as up
       body = up.urlencode({
         p['name']: p.get('value', '')
         for p in post_data['params']
@@ -196,6 +196,12 @@ def _parse_burp_item(item: ET.Element) -> Optional[ScanTarget]:
   }
 
 
+_ALL_HTTP_METHODS = (
+  'GET ', 'POST ', 'PUT ', 'PATCH ', 'DELETE ',
+  'OPTIONS ', 'HEAD ', 'CONNECT ', 'TRACE ',
+)
+
+
 def _parse_raw_http_request(raw: str) -> tuple[Dict[str, str], str]:
   """
   Parse a raw HTTP/1.1 request string into (headers_dict, body_str).
@@ -213,8 +219,8 @@ def _parse_raw_http_request(raw: str) -> tuple[Dict[str, str], str]:
     header_part = raw
 
   lines = header_part.replace('\r\n', '\n').split('\n')
-  # Skip request line (first non-empty line starting with a method)
-  start = 1 if lines and lines[0].startswith(('GET ', 'POST ', 'PUT ', 'PATCH ', 'DELETE ')) else 0
+  # Skip request line (first non-empty line starting with any HTTP method)
+  start = 1 if lines and any(lines[0].startswith(m) for m in _ALL_HTTP_METHODS) else 0
   for line in lines[start:]:
     if ':' in line:
       name, _, value = line.partition(':')

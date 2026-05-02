@@ -14,11 +14,11 @@ Standalone-safe: stdlib only.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
 import re
-import ssl
 import time
 import urllib.error
 import urllib.request as _req
@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ._constants import OWNERSHIP_KEYS
+from .http_client import get_opener
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,8 @@ def build_baseline(
     )
     if fp:
       fps.append(fp)
-    _sleep(delay if delay > 0 else 0.1)
+    if delay > 0:
+      _sleep(delay)
 
   if not fps:
     logger.warning("Baseline fetch failed for %s", url)
@@ -242,7 +244,6 @@ def _rebuild_with_extra_volatiles(
   # Also apply the standard stabilise pass (already applied, but idempotent)
   stable = _stabilise(body, baseline_body=None)
   new_hash = hashlib.sha256(stable.encode()).hexdigest()[:16]
-  import dataclasses
   return dataclasses.replace(fp, stable_hash=new_hash)
 
 
@@ -271,21 +272,7 @@ def _fetch_fingerprint(
     method=method,
   )
 
-  handler_chain: list = []
-  if proxy:
-    proxy_handler = _req.ProxyHandler({
-      'http':  proxy,
-      'https': proxy,
-    })
-    handler_chain.append(proxy_handler)
-  if not verify_ssl:
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    handler_chain.append(_req.HTTPSHandler(context=ssl_ctx))
-  handler_chain.append(_req.HTTPCookieProcessor())
-
-  opener = _req.build_opener(*handler_chain)
+  opener = get_opener(proxy, verify_ssl)
 
   t0 = time.time()
   try:

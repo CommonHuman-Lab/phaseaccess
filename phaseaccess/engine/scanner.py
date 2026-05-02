@@ -28,6 +28,7 @@ import json as _json
 import logging
 import threading
 import time
+import urllib.parse as _up
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -35,13 +36,14 @@ logger = logging.getLogger(__name__)
 
 from .reporter import (
   IDORFinding, IDORType, IDORLocation, Confidence, IDType, ScanResult,
+  CONFIDENCE_RANK,
 )
 from .extractor import (
   ObjectRef, extract_all, harvest_ids_from_response,
 )
 from .id_engine import generate_candidates, detect_id_type
 from .fingerprint import build_baseline, ResponseFingerprint
-from .tamper import send_tampered, send_method_variants, send_param_pollution
+from .tamper import send_tampered, send_method_variants, send_param_pollution, fire_request
 from .comparator import compare, DiffVerdict
 from .session import SessionPair, pair_from_config
 
@@ -274,7 +276,7 @@ def _scan_endpoint(
         idor_type = _classify_idor_type(
           ref, cand.is_foreign, pair.is_dual, diff.verdict
         )
-        finding = IDORFinding(
+        finding = _make_finding(
           idor_type=idor_type,
           confidence=diff.confidence,
           location=ref.location,
@@ -284,19 +286,16 @@ def _scan_endpoint(
           id_type=ref.id_type,
           original_value=ref.value,
           tampered_value=cand.value,
-          baseline_status=baseline.status,
-          tampered_status=tamper_result.fingerprint.status,
-          baseline_length=baseline.body_length,
-          tampered_length=tamper_result.fingerprint.body_length,
-          owner_fields_leaked=diff.leaked_fields,
-          evidence_snippet=diff.evidence_snippet,
+          baseline=baseline,
+          tampered_fp=tamper_result.fingerprint,
+          diff_result=diff,
+          notes="; ".join(diff.signals[:5]),
           session_a_label=opts.session_a_label,
           session_b_label=opts.session_b_label,
-          notes="; ".join(diff.signals[:5]),
           curl_command=_build_curl_command(
             tamper_result.effective_url,
             opts.method,
-            tamper_result.effective_headers,
+            tamper_result.effective_headers or {},
             tamper_result.effective_body,
           ),
         )
@@ -325,77 +324,11 @@ def _scan_endpoint(
 
     # 4. Method bypass check
     if opts.method_bypass:
-      method_results = send_method_variants(
-        ref=ref,
-        extra_headers=pair.headers_for('b') if pair.is_dual else pair.headers_for('a'),
-        cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
-        proxy=opts.proxy,
-        timeout=opts.timeout,
-        verify_ssl=opts.verify_ssl,
-        delay=opts.delay,
-      )
-      partial.requests_sent += len(method_results)
-      for mr in method_results:
-        diff = compare(baseline, mr.fingerprint, known_foreign or None)
-        if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
-          partial.findings.append(IDORFinding(
-            idor_type=IDORType.METHOD_BYPASS,
-            confidence=diff.confidence,
-            location=ref.location,
-            url=url,
-            method=mr.ref.method,
-            parameter=ref.param,
-            id_type=ref.id_type,
-            original_value=ref.value,
-            tampered_value=ref.value,
-            baseline_status=baseline.status,
-            tampered_status=mr.fingerprint.status,
-            baseline_length=baseline.body_length,
-            tampered_length=mr.fingerprint.body_length,
-            owner_fields_leaked=diff.leaked_fields,
-            evidence_snippet=diff.evidence_snippet,
-            session_a_label=opts.session_a_label,
-            session_b_label=opts.session_b_label,
-            notes=f"method bypass via {mr.ref.method}",
-          ))
-          log(f"[+] METHOD BYPASS {mr.ref.method} {ref.param} @ {url}")
+      _run_method_bypass(ref, baseline, known_foreign, url, opts, pair, partial)
 
     # 5. Param pollution
     if opts.param_pollution and ref.location == IDORLocation.QUERY_PARAM and candidates:
-      pp_result = send_param_pollution(
-        ref=ref,
-        tampered_value=candidates[0].value,
-        extra_headers=pair.headers_for('b') if pair.is_dual else pair.headers_for('a'),
-        cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
-        proxy=opts.proxy,
-        timeout=opts.timeout,
-        verify_ssl=opts.verify_ssl,
-        delay=opts.delay,
-      )
-      partial.requests_sent += 1
-      if pp_result:
-        diff = compare(baseline, pp_result.fingerprint, known_foreign or None)
-        if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
-          partial.findings.append(IDORFinding(
-            idor_type=IDORType.PARAM_POLLUTION,
-            confidence=diff.confidence,
-            location=ref.location,
-            url=url,
-            method=opts.method,
-            parameter=ref.param,
-            id_type=ref.id_type,
-            original_value=ref.value,
-            tampered_value=candidates[0].value,
-            baseline_status=baseline.status,
-            tampered_status=pp_result.fingerprint.status,
-            baseline_length=baseline.body_length,
-            tampered_length=pp_result.fingerprint.body_length,
-            owner_fields_leaked=diff.leaked_fields,
-            evidence_snippet=diff.evidence_snippet,
-            session_a_label=opts.session_a_label,
-            session_b_label=opts.session_b_label,
-            notes="HTTP parameter pollution",
-          ))
+      _run_param_pollution(ref, baseline, known_foreign, url, opts, pair, partial, candidates)
 
     # 6. Mass assignment check
     if opts.mass_assignment:
@@ -421,6 +354,96 @@ def _scan_endpoint(
         log(f"[+] SOFT-DELETE BYPASS — {ref.param} @ {url}")
 
   return partial
+
+
+# ---------------------------------------------------------------------------
+# Method bypass + param pollution sub-checks (extracted from _scan_endpoint)
+# ---------------------------------------------------------------------------
+
+def _run_method_bypass(
+  ref:          ObjectRef,
+  baseline:     ResponseFingerprint,
+  known_foreign: Dict[str, str],
+  url:          str,
+  opts:         ScanOptions,
+  pair:         SessionPair,
+  partial:      ScanResult,
+) -> None:
+  """Fire all alternative HTTP methods and record any method-bypass findings."""
+  method_results = send_method_variants(
+    ref=ref,
+    extra_headers=pair.headers_for('b') if pair.is_dual else pair.headers_for('a'),
+    cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
+    proxy=opts.proxy,
+    timeout=opts.timeout,
+    verify_ssl=opts.verify_ssl,
+    delay=opts.delay,
+  )
+  partial.requests_sent += len(method_results)
+  for mr in method_results:
+    diff = compare(baseline, mr.fingerprint, known_foreign or None)
+    if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
+      partial.findings.append(_make_finding(
+        idor_type=IDORType.METHOD_BYPASS,
+        confidence=diff.confidence,
+        location=ref.location,
+        url=url,
+        method=mr.ref.method,
+        parameter=ref.param,
+        id_type=ref.id_type,
+        original_value=ref.value,
+        tampered_value=ref.value,
+        baseline=baseline,
+        tampered_fp=mr.fingerprint,
+        diff_result=diff,
+        notes=f"method bypass via {mr.ref.method}",
+        session_a_label=opts.session_a_label,
+        session_b_label=opts.session_b_label,
+      ))
+
+
+def _run_param_pollution(
+  ref:          ObjectRef,
+  baseline:     ResponseFingerprint,
+  known_foreign: Dict[str, str],
+  url:          str,
+  opts:         ScanOptions,
+  pair:         SessionPair,
+  partial:      ScanResult,
+  candidates:   list,
+) -> None:
+  """Attempt HTTP parameter pollution with the first candidate and record findings."""
+  pp_result = send_param_pollution(
+    ref=ref,
+    tampered_value=candidates[0].value,
+    extra_headers=pair.headers_for('b') if pair.is_dual else pair.headers_for('a'),
+    cookies=pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a'),
+    proxy=opts.proxy,
+    timeout=opts.timeout,
+    verify_ssl=opts.verify_ssl,
+    delay=opts.delay,
+  )
+  partial.requests_sent += 1
+  if pp_result:
+    diff = compare(baseline, pp_result.fingerprint, known_foreign or None)
+    if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
+      partial.findings.append(_make_finding(
+        idor_type=IDORType.PARAM_POLLUTION,
+        confidence=diff.confidence,
+        location=ref.location,
+        url=url,
+        method=opts.method,
+        parameter=ref.param,
+        id_type=ref.id_type,
+        original_value=ref.value,
+        tampered_value=candidates[0].value,
+        baseline=baseline,
+        tampered_fp=pp_result.fingerprint,
+        diff_result=diff,
+        notes="HTTP parameter pollution",
+        session_a_label=opts.session_a_label,
+        session_b_label=opts.session_b_label,
+      ))
 
 
 # ---------------------------------------------------------------------------
@@ -454,19 +477,8 @@ def _deduplicate_findings(findings: List[IDORFinding]) -> List[IDORFinding]:
   For each (url, parameter, idor_type) tuple keep only the finding with the
   highest confidence.  Preserves original order (first occurrence wins on tie).
   """
-  _CONF_ORDER = [
-    Confidence.CONFIRMED,
-    Confidence.HIGH,
-    Confidence.MEDIUM,
-    Confidence.LOW,
-    Confidence.INFO,
-  ]
-
   def _rank(c: str) -> int:
-    try:
-      return _CONF_ORDER.index(c)
-    except ValueError:
-      return len(_CONF_ORDER)
+    return CONFIDENCE_RANK.get(c, len(CONFIDENCE_RANK))
 
   best: Dict[tuple, IDORFinding] = {}
   for f in findings:
@@ -492,6 +504,14 @@ def _classify_idor_type(
   is_dual:    bool,
   verdict:    DiffVerdict,
 ) -> IDORType:
+  """
+  Classify the IDOR type based on session mode and candidate origin.
+
+  - Dual-session + foreign ID   → HORIZONTAL (peer access: attacker reaches owner's resource)
+  - Dual-session + non-foreign  → VERTICAL   (privilege escalation: attacker uses lower-priv session
+                                               to access a resource their own ID should not reach)
+  - Single-session + any        → HORIZONTAL (default: lateral access assumption in single-session mode)
+  """
   if is_dual and is_foreign:
     return IDORType.HORIZONTAL
   if is_dual:
@@ -500,8 +520,56 @@ def _classify_idor_type(
 
 
 # ---------------------------------------------------------------------------
-# Mass-assignment check
+# IDORFinding factory — reduces constructor duplication across scanner checks
 # ---------------------------------------------------------------------------
+
+def _make_finding(
+  *,
+  idor_type:       IDORType,
+  confidence:      Confidence,
+  location:        IDORLocation,
+  url:             str,
+  method:          str,
+  parameter:       str,
+  id_type:         IDType,
+  original_value:  str,
+  tampered_value:  str,
+  baseline:        ResponseFingerprint,
+  tampered_fp:     ResponseFingerprint,
+  diff_result:     Any = None,
+  evidence_snippet: str = "",
+  notes:           str = "",
+  session_a_label: str = "",
+  session_b_label: str = "",
+  curl_command:    str = "",
+) -> IDORFinding:
+  """Construct an IDORFinding with all common fields pre-filled."""
+  leaked = diff_result.leaked_fields if diff_result is not None else []
+  snippet = (diff_result.evidence_snippet if diff_result is not None else evidence_snippet) or evidence_snippet
+  return IDORFinding(
+    idor_type=idor_type,
+    confidence=confidence,
+    location=location,
+    url=url,
+    method=method,
+    parameter=parameter,
+    id_type=id_type,
+    original_value=original_value,
+    tampered_value=tampered_value,
+    baseline_status=baseline.status,
+    tampered_status=tampered_fp.status,
+    baseline_length=baseline.body_length,
+    tampered_length=tampered_fp.body_length,
+    owner_fields_leaked=leaked,
+    evidence_snippet=snippet,
+    session_a_label=session_a_label,
+    session_b_label=session_b_label,
+    notes=notes,
+    curl_command=curl_command,
+  )
+
+
+
 
 # Ownership field names we try to inject
 _MA_FIELDS = [
@@ -529,8 +597,7 @@ def _check_mass_assignment(
   if ref.location == IDORLocation.JSON_BODY and isinstance(ref.body_context, dict):
     injected = dict(ref.body_context)
   elif ref.location == IDORLocation.POST_BODY and isinstance(ref.body_context, str):
-    import urllib.parse as _up2
-    injected = {k: v[0] for k, v in _up2.parse_qs(
+    injected = {k: v[0] for k, v in _up.parse_qs(
         ref.body_context, keep_blank_values=True).items()}
   else:
     injected = {}
@@ -541,11 +608,12 @@ def _check_mass_assignment(
 
   body_str = _json.dumps(injected)
 
-  req_headers = dict(pair.headers_for('a'))
+  # Use session_b (attacker) in dual-session mode; fall back to session_a
+  req_headers = dict(pair.headers_for('b') if pair.is_dual else pair.headers_for('a'))
   req_headers.setdefault('Content-Type', 'application/json')
-  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
-  if pair.cookies_for('a'):
-    req_headers.setdefault('Cookie', pair.cookies_for('a'))
+  cookies = pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a')
+  if cookies:
+    req_headers.setdefault('Cookie', cookies)
 
   fp = _do_single_request(
     ref.url, ref.method, req_headers, body_str,
@@ -567,7 +635,7 @@ def _check_mass_assignment(
   if injected_reflected and confidence not in (Confidence.CONFIRMED, Confidence.HIGH):
     confidence = Confidence.HIGH
 
-  return IDORFinding(
+  return _make_finding(
     idor_type=IDORType.MASS_ASSIGNMENT,
     confidence=confidence,
     location=ref.location,
@@ -577,17 +645,14 @@ def _check_mass_assignment(
     id_type=ref.id_type,
     original_value=ref.value,
     tampered_value=foreign_id,
-    baseline_status=baseline.status,
-    tampered_status=fp.status,
-    baseline_length=baseline.body_length,
-    tampered_length=fp.body_length,
-    owner_fields_leaked=diff.leaked_fields,
-    evidence_snippet=diff.evidence_snippet,
-    session_a_label=opts.session_a_label,
-    session_b_label=opts.session_b_label,
+    baseline=baseline,
+    tampered_fp=fp,
+    diff_result=diff,
     notes="mass assignment: injected ownership field accepted" + (
       "; injected value reflected in response" if injected_reflected else ""
     ),
+    session_a_label=opts.session_a_label,
+    session_b_label=opts.session_b_label,
   )
 
 
@@ -616,12 +681,16 @@ def _check_soft_delete(
   When a tampered request returns 404 (resource not found / deleted), retry
   with soft-delete hint parameters to see if the resource is still accessible.
   """
-  import urllib.parse as _up
+  # Only proceed when baseline signals a potentially deleted/absent resource
+  # OR when a 200 baseline might grow with deleted items included.
+  if baseline.status not in (200, 404):
+    return None
 
-  req_headers = dict(pair.headers_for('a'))
-  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
-  if pair.cookies_for('a'):
-    req_headers.setdefault('Cookie', pair.cookies_for('a'))
+  # Use session_b (attacker) in dual-session mode; fall back to session_a
+  req_headers = dict(pair.headers_for('b') if pair.is_dual else pair.headers_for('a'))
+  cookies = pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a')
+  if cookies:
+    req_headers.setdefault('Cookie', cookies)
 
   for param, value in _SOFT_DELETE_HINTS:
     parsed  = _up.urlparse(ref.url)
@@ -638,7 +707,7 @@ def _check_soft_delete(
 
     # Positive signal: 404 baseline but 200 with the hint param
     if baseline.status == 404 and fp.status == 200 and fp.body_length > 50:
-      return IDORFinding(
+      return _make_finding(
         idor_type=IDORType.SOFT_DELETE,
         confidence=Confidence.HIGH,
         location=IDORLocation.QUERY_PARAM,
@@ -648,22 +717,19 @@ def _check_soft_delete(
         id_type=ref.id_type,
         original_value=ref.value,
         tampered_value=value,
-        baseline_status=baseline.status,
-        tampered_status=fp.status,
-        baseline_length=baseline.body_length,
-        tampered_length=fp.body_length,
-        owner_fields_leaked=[],
+        baseline=baseline,
+        tampered_fp=fp,
         evidence_snippet=fp.body[:500],
+        notes=f"soft-delete bypass: {param}={value} reveals deleted resource",
         session_a_label=opts.session_a_label,
         session_b_label=opts.session_b_label,
-        notes=f"soft-delete bypass: {param}={value} reveals deleted resource",
       )
 
     # Weaker signal: same-family success, body grew significantly
     if fp.status == 200 and baseline.status == 200:
       growth = (fp.body_length - baseline.body_length) / max(baseline.body_length, 1)
       if growth > 0.3 and fp.stable_hash != baseline.stable_hash:
-        return IDORFinding(
+        return _make_finding(
           idor_type=IDORType.SOFT_DELETE,
           confidence=Confidence.MEDIUM,
           location=IDORLocation.QUERY_PARAM,
@@ -673,15 +739,12 @@ def _check_soft_delete(
           id_type=ref.id_type,
           original_value=ref.value,
           tampered_value=value,
-          baseline_status=baseline.status,
-          tampered_status=fp.status,
-          baseline_length=baseline.body_length,
-          tampered_length=fp.body_length,
-          owner_fields_leaked=[],
+          baseline=baseline,
+          tampered_fp=fp,
           evidence_snippet=fp.body[:500],
+          notes=f"soft-delete bypass: {param}={value} returns extra content",
           session_a_label=opts.session_a_label,
           session_b_label=opts.session_b_label,
-          notes=f"soft-delete bypass: {param}={value} returns extra content",
         )
 
   return None
@@ -718,7 +781,7 @@ def _check_blind_idor(
   if tamper_fp.body_length > 100:
     return None
 
-  return IDORFinding(
+  return _make_finding(
     idor_type=IDORType.BLIND,
     confidence=Confidence.MEDIUM,
     location=ref.location,
@@ -728,11 +791,8 @@ def _check_blind_idor(
     id_type=ref.id_type,
     original_value=ref.value,
     tampered_value=tampered_value,
-    baseline_status=baseline.status,
-    tampered_status=tamper_fp.status,
-    baseline_length=baseline.body_length,
-    tampered_length=tamper_fp.body_length,
-    owner_fields_leaked=[],
+    baseline=baseline,
+    tampered_fp=tamper_fp,
     evidence_snippet=tamper_fp.body[:500],
     notes=(
       f"blind IDOR: status {baseline.status} → {tamper_fp.status} "
@@ -777,10 +837,9 @@ def _do_single_request(
   verify_ssl: bool,
   delay:      float,
 ) -> Optional[ResponseFingerprint]:
-  from .tamper import _do_request as _tamper_do_request
   if delay > 0:
     time.sleep(delay)
-  return _tamper_do_request(
+  return fire_request(
     url=url,
     method=method,
     headers=headers,

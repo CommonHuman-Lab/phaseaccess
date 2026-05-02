@@ -12,7 +12,7 @@ Usage:
 """
 
 from .scanner import scan, ScanOptions
-from .reporter import ScanResult, IDORFinding, IDORType, Confidence, IDORLocation, IDType
+from .reporter import ScanResult, IDORFinding, IDORType, Confidence, IDORLocation, IDType, CONFIDENCE_RANK
 
 __all__ = [
   "scan",
@@ -21,6 +21,7 @@ __all__ = [
   "IDORFinding",
   "IDORType",
   "Confidence",
+  "CONFIDENCE_RANK",
   "IDORLocation",
   "IDType",
 ]
