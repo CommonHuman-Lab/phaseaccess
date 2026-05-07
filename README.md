@@ -5,12 +5,13 @@
 The most thorough open-source IDOR / BOLA scanner available.  
 PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *sessions*, and *evidence*.
 
-```
-    ____  __                    ___                           
-   / __ \/ /_  ____ _________  /   | _____________  __________
-  / /_/ / __ \/ __ `/ ___/ _ \/ /| |/ ___/ ___/ _ \/ ___/ ___/
- / ____/ / / / /_/ (__  )  __/ ___ / /__/ /__/  __(__  |__  ) 
-/_/   /_/ /_/\__,_/____/\___/_/  |_\___/\___/\___/____/____/  
+```bash
+pip install phaseaccess
+
+# from source 
+git clone https://github.com/CommonHuman-Lab/phaseaccess.git
+cd phaseaccess
+python -m phaseaccess
 ```
 
 ---
@@ -30,22 +31,6 @@ PhaseAccess does that too — but smarter:
 - **curl reproduction** — every finding ships a ready-to-paste curl command
 
 Zero runtime dependencies. Pure stdlib Python 3.10+.
-
----
-
-## Install
-
-```bash
-pip install phaseaccess
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/CommonHuman-Lab/phaseaccess.git
-cd phaseaccess
-pip install -e .
-```
 
 ---
 
@@ -115,7 +100,7 @@ Session A — resource owner:
 Session B — attacker (enables dual-session mode):
   --header-b KEY:VALUE Header (repeatable)
   --cookie-b           Cookie string
-  --label-b LABEL      Session label (enables dual-session)
+  --label-b LABEL      Session label (default: session_b)
 
 Network:
   --proxy URL          HTTP proxy (e.g. http://127.0.0.1:8080)
