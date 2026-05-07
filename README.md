@@ -1,7 +1,5 @@
 # PhaseAccess
 
-> **Authorization is just a suggestion.**
-
 The most thorough open-source IDOR / BOLA scanner available.  
 PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *sessions*, and *evidence*.
 
@@ -14,12 +12,11 @@ cd phaseaccess
 python -m phaseaccess
 ```
 
+> Point it at a target. Get findings. Drop it in a pipeline.
+
 ---
 
-## Why PhaseAccess?
-
-Most IDOR scanners just hammer IDs and check if the response looks "different".  
-PhaseAccess does that too — but smarter:
+## Why use PhaseAccess?
 
 - **Semantic diffing** — compares ownership fields (`user_id`, `email`, `owner_id`) across responses, not just status codes
 - **Dual-session mode** — use two sets of credentials; get CONFIRMED findings when user B's data appears in user A's request
@@ -252,9 +249,9 @@ Target URL
 
 ---
 
-## License
+## 📜 License
 
-AGPL-3.0 — free to use, modify, and distribute.  
-If you run this as a service or ship it in a product, the source must remain open.
+Licensed under the [AGPLv3](LICENSE).
+You are free to use, modify, and distribute this software. If you run it as a service or distribute it, the source must remain open.
 
 For commercial licensing, contact the author.
