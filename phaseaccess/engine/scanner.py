@@ -460,22 +460,27 @@ def _run_param_pollution(
 # ---------------------------------------------------------------------------
 
 def _build_session_pair(opts: ScanOptions) -> SessionPair:
-  from .session import Session
-  ua = opts.user_agent or "PhaseAccess/1.0"
-  a_headers = dict(opts.session_a_headers)
-  a_headers.setdefault('User-Agent', ua)
+  from .session import Session, random_ua
+  raw_ua = opts.user_agent or "random"
+  ua = random_ua() if raw_ua.lower() == "random" else raw_ua
+
+  def _apply_headers(base: Dict[str, str]) -> Dict[str, str]:
+    h = dict(base)
+    h.setdefault('User-Agent', ua)
+    h.setdefault('Accept', 'application/json, */*;q=0.9')
+    h.setdefault('Accept-Language', 'en-US,en;q=0.9')
+    return h
+
   session_a = Session(
     label=opts.session_a_label,
-    headers=a_headers,
+    headers=_apply_headers(opts.session_a_headers),
     cookies=opts.session_a_cookies,
   )
   session_b: Optional[Session] = None
   if opts.session_b_label:
-    b_headers = dict(opts.session_b_headers)
-    b_headers.setdefault('User-Agent', ua)
     session_b = Session(
       label=opts.session_b_label,
-      headers=b_headers,
+      headers=_apply_headers(opts.session_b_headers),
       cookies=opts.session_b_cookies,
     )
   return SessionPair(session_a=session_a, session_b=session_b)
@@ -605,8 +610,7 @@ def _check_direct_cross_session(
   if not leaked:
     return None
 
-  from .extractor import extract_all as _extract
-  refs = _extract(url, opts.method)
+  refs = extract_all(url, opts.method)
   first_ref = refs[0] if refs else None
 
   return IDORFinding(

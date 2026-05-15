@@ -285,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-confidence", default="", dest="min_confidence",
                    help="Minimum confidence to report: confirmed high medium low info")
     p.add_argument("--user-agent", default="", dest="user_agent",
-                   help="Override User-Agent header (default: PhaseAccess/1.0)")
+                   help="Override User-Agent header (default: random browser UA; use 'random' to rotate)")
     p.add_argument("--no-method-bypass", action="store_true")
     p.add_argument("--no-param-pollution", action="store_true")
     p.add_argument("--no-mass-assignment", action="store_true")
@@ -490,7 +490,7 @@ def main() -> None:
         soft_delete=not args.no_soft_delete,
         blind_idor=not args.no_blind_idor,
         extra_urls=combined_extra_urls,
-        user_agent=getattr(args, "user_agent", "") or "PhaseAccess/1.0",
+        user_agent=getattr(args, "user_agent", "") or "random",
         on_log=live_log,
     )
 

@@ -25,10 +25,11 @@ class TestSession:
     assert h["X-Role"] == "admin"
 
   def test_effective_headers_sets_user_agent_default(self):
+    from phaseaccess.engine.session import _UA_POOL
     s = Session(label="test")
     h = s.effective_headers()
     assert "User-Agent" in h
-    assert h["User-Agent"] == "PhaseAccess/1.0"
+    assert h["User-Agent"] in _UA_POOL
 
   def test_effective_headers_does_not_override_ua(self):
     s = Session(label="test", headers={"User-Agent": "MyBot/2.0"})
