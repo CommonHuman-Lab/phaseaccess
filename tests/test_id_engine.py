@@ -259,3 +259,96 @@ class TestSlugCandidates:
     def test_no_numeric_suffix_generates_overrides(self):
         cands = _slug_candidates("my-document")
         assert any(c.value == "admin" for c in cands)
+
+
+# ---------------------------------------------------------------------------
+# IDType.HEX detection
+# ---------------------------------------------------------------------------
+
+class TestHexDetection:
+    def test_short_hex_with_letter_detected(self):
+        assert detect_id_type("fa1") == IDType.HEX
+
+    def test_hex_mixed_case_detected(self):
+        assert detect_id_type("1A2B") == IDType.HEX
+
+    def test_pure_digit_not_hex(self):
+        # all-digit short values are INTEGER, not HEX
+        assert detect_id_type("123") == IDType.INTEGER
+
+    def test_hex_all_lowercase_detected(self):
+        assert detect_id_type("1a2b3c") == IDType.HEX
+
+    def test_hex_too_long_not_hex(self):
+        # 17+ chars fall through to base64 / unknown
+        result = detect_id_type("1a2b3c4d5e6f7a8b9c")
+        assert result != IDType.HEX
+
+    def test_english_word_not_hex(self):
+        # "cafe" is valid hex but no digits → only letters a-f → should still detect as HEX
+        # because it matches _RE_HEX and has a-f chars
+        result = detect_id_type("cafe")
+        assert result == IDType.HEX
+
+    def test_base64_false_positive_english_word_not_base64(self):
+        # "challenges" is valid base64 chars but has no non-alpha → must NOT be BASE64
+        assert detect_id_type("challenges") == IDType.UNKNOWN
+
+    def test_base64_false_positive_horizontal(self):
+        assert detect_id_type("horizontal") == IDType.UNKNOWN
+
+    def test_real_base64_still_detected(self):
+        import base64
+        encoded = base64.b64encode(b"user:42").decode()
+        assert detect_id_type(encoded) == IDType.BASE64
+
+
+# ---------------------------------------------------------------------------
+# _hex_candidates
+# ---------------------------------------------------------------------------
+
+class TestHexCandidates:
+    def test_generates_from_id_engine(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("fa", 10)
+        assert len(cands) > 0
+
+    def test_plus_one_candidate(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("a", 10)
+        values = [c.value for c in cands]
+        assert "b" in values
+
+    def test_minus_one_candidate(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("10", 10)
+        values = [c.value for c in cands]
+        assert "f" in values
+
+    def test_zero_not_subtracted_below_zero(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("1", 10)
+        values = [c.value for c in cands]
+        # n=1, delta=1 → n-delta=0, which is NOT > 0 so hex -1 is skipped
+        assert "-1" not in values
+
+    def test_invalid_hex_returns_empty(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("gg", 10)  # not valid hex
+        assert cands == []
+
+    def test_preserves_lowercase(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("ff", 4)
+        values = [c.value for c in cands]
+        assert all(v == v.lower() for v in values if v not in ("1", "0"))
+
+    def test_preserves_uppercase(self):
+        from phaseaccess.engine.id_engine import _hex_candidates
+        cands = _hex_candidates("FF", 4)
+        values = [c.value for c in cands]
+        assert any(v == v.upper() for v in values if v not in ("1", "0"))
+
+    def test_generate_candidates_hex_type(self):
+        cands = generate_candidates("fa1", IDType.HEX)
+        assert len(cands) > 0

@@ -42,6 +42,7 @@ class IDType(str, Enum):
   HASH_SHA256         = "hash_sha256"
   SLUG                = "slug"                  # human-readable e.g. "my-document"
   SNOWFLAKE           = "snowflake"             # Twitter/Discord-style epoch IDs
+  HEX                 = "hex"                   # short hex-encoded integer e.g. "fa1", "1a2b"
   UNKNOWN             = "unknown"
 
 

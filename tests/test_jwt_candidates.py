@@ -201,3 +201,105 @@ class TestJwtCandidates:
         assert any(v.endswith(".") and v.count(".") == 2 for v in values), (
             "Expected at least one alg:none or empty-sig candidate"
         )
+
+    # -----------------------------------------------------------------------
+    # kid path traversal injection
+    # -----------------------------------------------------------------------
+
+    def test_kid_injection_produces_candidates(self):
+        header = {"alg": "HS256", "typ": "JWT", "kid": "keys/key1.pem"}
+        token = _make_jwt(header, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        kid_cands = [c for c in candidates if "kid" in c.description]
+        assert len(kid_cands) >= 1
+
+    def test_kid_injection_path_traversal_values(self):
+        header = {"alg": "HS256", "typ": "JWT", "kid": "original"}
+        token = _make_jwt(header, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        kid_cands = [c for c in candidates if "kid" in c.description]
+        injected_kids = set()
+        for c in kid_cands:
+            hdr = _decode_jwt_header(c.value)
+            injected_kids.add(hdr.get("kid"))
+        assert any("dev/null" in k or "etc/passwd" in k or "OR" in k or k == "0"
+                   for k in injected_kids), f"Expected traversal kids, got: {injected_kids}"
+
+    def test_kid_injection_empty_sig_variant(self):
+        """kid injection must produce an empty-signature variant."""
+        header = {"alg": "HS256", "typ": "JWT", "kid": "key1"}
+        token = _make_jwt(header, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        kid_empty = [c for c in candidates if "kid" in c.description and c.value.endswith(".")]
+        assert len(kid_empty) >= 1
+
+    def test_no_kid_field_no_kid_injection(self):
+        """Tokens without a kid header should not get kid injection candidates."""
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        kid_cands = [c for c in candidates if "kid" in c.description]
+        assert len(kid_cands) == 0
+
+    # -----------------------------------------------------------------------
+    # RS256 → HS256 algorithm confusion
+    # -----------------------------------------------------------------------
+
+    def test_rs256_to_hs256_confusion_produced(self):
+        token = _make_jwt({"alg": "RS256", "typ": "JWT"}, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        conf_cands = [c for c in candidates if "HS256" in c.description and "confusion" in c.description]
+        assert len(conf_cands) >= 1
+
+    def test_rs256_to_hs256_header_rewritten(self):
+        token = _make_jwt({"alg": "RS256", "typ": "JWT"}, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        conf_cands = [c for c in candidates if "HS256" in c.description and "confusion" in c.description]
+        for c in conf_cands:
+            hdr = _decode_jwt_header(c.value)
+            assert hdr["alg"] == "HS256"
+
+    def test_rs256_confusion_has_empty_sig(self):
+        token = _make_jwt({"alg": "RS256", "typ": "JWT"}, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        conf_cands = [c for c in candidates if "HS256" in c.description and "confusion" in c.description]
+        for c in conf_cands:
+            assert c.value.endswith("."), f"RS256→HS256 candidate must end with '.', got: {c.value}"
+
+    def test_hs256_token_no_algorithm_confusion(self):
+        """HS256 tokens should NOT get an RS256→HS256 confusion candidate."""
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1"})
+        candidates = _jwt_candidates(token)
+        conf_cands = [c for c in candidates if "confusion" in c.description]
+        assert len(conf_cands) == 0
+
+    # -----------------------------------------------------------------------
+    # exp claim removal
+    # -----------------------------------------------------------------------
+
+    def test_exp_removal_produced(self):
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1", "exp": 9999999999})
+        candidates = _jwt_candidates(token)
+        exp_cands = [c for c in candidates if "exp" in c.description and "removed" in c.description]
+        assert len(exp_cands) >= 1
+
+    def test_exp_removal_payload_has_no_exp(self):
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1", "exp": 9999999999})
+        candidates = _jwt_candidates(token)
+        exp_cands = [c for c in candidates if "exp" in c.description and "removed" in c.description]
+        for c in exp_cands:
+            payload = _decode_jwt_payload(c.value)
+            assert "exp" not in payload
+
+    def test_exp_removal_has_empty_sig(self):
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1", "exp": 1234567890})
+        candidates = _jwt_candidates(token)
+        exp_cands = [c for c in candidates if "exp" in c.description and "removed" in c.description]
+        for c in exp_cands:
+            assert c.value.endswith("."), f"exp-removed token must end with '.', got: {c.value}"
+
+    def test_no_exp_no_exp_removal(self):
+        """JWTs without exp should not get an exp-removal candidate."""
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1", "iat": 1700000000})
+        candidates = _jwt_candidates(token)
+        exp_cands = [c for c in candidates if "exp" in c.description and "removed" in c.description]
+        assert len(exp_cands) == 0

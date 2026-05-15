@@ -24,16 +24,15 @@ import copy
 import json
 import logging
 import time
-import urllib.error
 import urllib.parse as up
-import urllib.request as _req
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from commonhuman_core.http import HttpClient
 
 from .reporter import IDORLocation
 from .extractor import ObjectRef
 from .fingerprint import ResponseFingerprint, fingerprint_response
-from .http_client import get_opener
 
 logger = logging.getLogger(__name__)
 
@@ -257,75 +256,52 @@ def _build_request(
 # ---------------------------------------------------------------------------
 
 def fire_request(
-  url:           str,
-  method:        str,
-  headers:       Dict[str, str],
-  body:          str,
-  proxy:         str,
-  timeout:       int,
-  verify_ssl:    bool = True,
-  _retries:      int = 2,
-  baseline_body: Optional[str] = None,
+    url:           str,
+    method:        str,
+    headers:       Dict[str, str],
+    body:          str,
+    proxy:         str,
+    timeout:       int,
+    verify_ssl:    bool = True,
+    _retries:      int = 2,
+    baseline_body: Optional[str] = None,
 ) -> Optional[ResponseFingerprint]:
-  body_bytes = body.encode() if body else None
-  req = _req.Request(url, data=body_bytes, headers=headers, method=method)
-  opener = get_opener(proxy, verify_ssl)
+    client = HttpClient(
+        timeout=timeout,
+        proxy=proxy,
+        headers=headers,
+        verify_ssl=verify_ssl,
+        delay=0.0,
+    )
+    body_bytes = body.encode() if body else None
 
-  for attempt in range(1 + _retries):
-    t0 = time.time()
-    try:
-      with opener.open(req, timeout=timeout) as resp:
+    for attempt in range(1 + _retries):
+        t0 = time.time()
+        try:
+            resp = client._session.request(method, url, data=body_bytes, timeout=timeout)
+        except Exception as exc:
+            logger.debug("Network error on tampered request %s: %s", url, exc)
+            return None
+
         elapsed_ms = (time.time() - t0) * 1000
-        resp_body  = resp.read().decode('utf-8', errors='replace')
-        resp_headers: Dict[str, str] = dict(resp.headers)
-        status = resp.status
 
-      return fingerprint_response(
-        url=url,
-        method=method,
-        status=status,
-        body=resp_body,
-        headers=resp_headers,
-        elapsed_ms=elapsed_ms,
-        baseline_body=baseline_body,
-      )
+        if resp.status_code == 429 and attempt < _retries:
+            retry_after = int(resp.headers.get("Retry-After", "2"))
+            logger.debug("Rate limited on %s — backing off %ds", url, retry_after)
+            time.sleep(min(retry_after, 30))
+            continue
 
-    except urllib.error.HTTPError as exc:
-      # Rate-limited — back off and retry
-      if exc.code == 429 and attempt < _retries:
-        retry_after = int(exc.headers.get('Retry-After', '2'))
-        logger.debug("Rate limited on %s — backing off %ds", url, retry_after)
-        time.sleep(min(retry_after, 30))
-        continue
-      # All other HTTP errors: still a valid fingerprint-able response
-      try:
-        elapsed_ms = (time.time() - t0) * 1000
-        resp_body  = exc.read().decode('utf-8', errors='replace')
-        resp_headers = dict(exc.headers)
         return fingerprint_response(
-          url=url,
-          method=method,
-          status=exc.code,
-          body=resp_body,
-          headers=resp_headers,
-          elapsed_ms=elapsed_ms,
-          baseline_body=baseline_body,
+            url=url,
+            method=method,
+            status=resp.status_code,
+            body=resp.text,
+            headers=dict(resp.headers),
+            elapsed_ms=elapsed_ms,
+            baseline_body=baseline_body,
         )
-      except Exception as inner:
-        logger.debug("Failed to read HTTPError body for %s: %s", url, inner)
-        return None
 
-    except urllib.error.URLError as exc:
-      logger.debug("Network error on tampered request %s: %s", url, exc.reason)
-      return None
-    except ssl.SSLError as exc:
-      logger.debug("SSL error on tampered request %s: %s", url, exc)
-      return None
-    except Exception as exc:
-      logger.debug("Unexpected error on tampered request %s: %s", url, exc)
-      return None
-
-  return None  # exhausted retries
+    return None
 
 
 # ---------------------------------------------------------------------------

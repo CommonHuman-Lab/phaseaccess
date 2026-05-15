@@ -6,10 +6,10 @@ PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *s
 ```bash
 pip install phaseaccess
 
-# from source 
-git clone https://github.com/CommonHuman-Lab/phaseaccess.git
-cd phaseaccess
-python -m phaseaccess
+# Install in virtual env
+python3 -m venv .venv
+source .venv/bin/activate
+pip install phaseaccess
 ```
 
 > Point it at a target. Get findings. Drop it in a pipeline.
@@ -27,8 +27,6 @@ python -m phaseaccess
 - **HAR / Burp Suite import** — replay your proxy traffic directly
 - **curl reproduction** — every finding ships a ready-to-paste curl command
 
-Zero runtime dependencies. Pure stdlib Python 3.10+.
-
 ---
 
 ## Quick start
@@ -40,8 +38,36 @@ phaseaccess -u "https://api.example.com/users/42" \
 
 # Dual-session: owner vs attacker — gets you CONFIRMED findings
 phaseaccess -u "https://api.example.com/users/42" \
-  -H "Authorization: Bearer <owner_token>"  --label-a owner \
+  -H "Authorization: Bearer <owner_token>" --label-a owner \
   --header-b "Authorization: Bearer <attacker_token>" --label-b attacker
+
+# Crawl the whole app and test every discovered endpoint
+phaseaccess -u "https://api.example.com/" \
+  -H "Authorization: Bearer <token>" --crawl --crawl-pages 100 --crawl-depth 4
+
+# JS-rendered SPA — use headless Chromium for endpoint discovery
+phaseaccess -u "https://api.example.com/" \
+  -H "Authorization: Bearer <token>" --browser-crawl
+
+# Form login — authenticate both sessions before scanning
+phaseaccess -u "https://app.example.com/profile" \
+  --login-url "https://app.example.com/login" \
+  --login-user alice --login-pass alice_pw \
+  --login-url-b "https://app.example.com/login" \
+  --login-user-b bob --login-pass-b bob_pw
+
+# Import all endpoints from an OpenAPI / Swagger spec
+phaseaccess -u "https://api.example.com/" \
+  -H "Authorization: Bearer <token>" \
+  --openapi https://api.example.com/openapi.json
+
+# Stored IDOR chainer: alice creates a resource, check if bob can read it
+phaseaccess -u "https://api.example.com/documents/1" \
+  -H "Authorization: Bearer <alice_token>" --label-a alice \
+  --header-b "Authorization: Bearer <bob_token>" --label-b bob \
+  --chain-create "POST:https://api.example.com/documents" \
+  --chain-body '{"title":"test"}' \
+  --chain-read "https://api.example.com/documents/{id}"
 
 # POST endpoint
 phaseaccess -u "https://api.example.com/orders" \
@@ -74,6 +100,12 @@ phaseaccess -u "https://api.example.com/users/42" \
 | **Soft-delete bypass** | `?include_deleted=true` reveals logically deleted resources |
 | **Blind IDOR** | Status code flips 403→200 with no body — side-effect may have occurred |
 | **JWT claim tampering** | `sub`, `user_id`, `role` mutations with `alg:none` test |
+| **JWT kid injection** | `kid` header path traversal (`../../dev/null`, `../../../../etc/passwd`) |
+| **JWT algorithm confusion** | RS256 → HS256 downgrade with empty signature |
+| **JWT exp removal** | Strip expiry claim to test for missing validation |
+| **Hex ID enumeration** | Detects and mutates short hex identifiers (e.g. `fa1`, `1a2b3c`) |
+| **Direct cross-session check** | Session B fetches session A's URL; confirms horizontal IDOR when ownership values leak |
+| **Stored IDOR chaining** | Session A creates resource, session B reads via `--chain-read` template |
 
 ---
 
@@ -88,16 +120,28 @@ Target:
   -d, --data           Request body (form-encoded or JSON)
   --extra-url URL      Additional endpoint to test (repeatable)
   --targets FILE       Import targets from HAR / Burp Suite XML / JSON file
+  --crawl              BFS-crawl the target and test all discovered endpoints
+  --crawl-pages N      Max pages to crawl (default: 100)
+  --crawl-depth N      Max crawl depth (default: 3)
+  --browser-crawl      Headless Chromium endpoint discovery for JS-rendered apps
+  --openapi FILE/URL   OpenAPI/Swagger spec — imports all endpoints to scan
+  --base-url URL       Base URL override when loading an OpenAPI spec
 
 Session A — resource owner:
   -H KEY:VALUE         Request header (repeatable)
   -c, --cookie         Cookie string
   --label-a LABEL      Session label (default: session_a)
+  --login-url URL      Login form URL for session A — authenticates before scanning
+  --login-user USER    Username for session A form login
+  --login-pass PASS    Password for session A form login
 
 Session B — attacker (enables dual-session mode):
   --header-b KEY:VALUE Header (repeatable)
   --cookie-b           Cookie string
   --label-b LABEL      Session label (default: session_b)
+  --login-url-b URL    Login form URL for session B
+  --login-user-b USER  Username for session B form login
+  --login-pass-b PASS  Password for session B form login
 
 Network:
   --proxy URL          HTTP proxy (e.g. http://127.0.0.1:8080)
@@ -114,6 +158,9 @@ Scan control:
   --no-mass-assignment Disable mass assignment check
   --no-soft-delete     Disable soft-delete bypass check
   --no-blind-idor      Disable blind IDOR check
+  --chain-create METHOD:URL  Stored IDOR: URL where session A creates a resource
+  --chain-body BODY    Request body for the chain-create POST
+  --chain-read URL     URL template where session B reads (use {id} placeholder)
 
 Output:
   --min-confidence     Minimum confidence to report: confirmed high medium low info
@@ -220,9 +267,15 @@ for finding in result.findings:
 ## How it works
 
 ```
-Target URL
+Target URL(s)
+    │
+    ├─ 0. Auth & discovery (optional)
+    │      Form login (session A + B), OpenAPI import,
+    │      BFS crawl or headless browser crawl
     │
     ├─ 1. Baseline (×2 fetches → variance-aware stable fingerprint)
+    │      Direct cross-session check: does session B see session A's
+    │      ownership values on session A's URL? → CONFIRMED immediately
     │
     ├─ 2. Extract object refs
     │      URL params, path segments, JSON body, form body,
@@ -230,19 +283,27 @@ Target URL
     │
     ├─ 3. Generate tamper candidates per ref
     │      integer neighbours, UUID v1 timestamp deltas,
-    │      nil/max UUID, Base64 mutations, JWT claim tampering,
+    │      nil/max UUID, Base64 mutations, hex neighbours,
+    │      JWT claim tampering (sub/user_id/role + alg:none),
+    │      JWT kid path traversal, RS256→HS256 confusion, exp removal,
     │      foreign IDs from session B's harvest
     │
     ├─ 4. Fire tampered requests (session B if dual, else session A)
     │      Compare fingerprints:
     │        ownership field values, JSON structure, body hash,
     │        status code delta, timing oracle
+    │      Dual-session + leaked ownership fields → upgrade to CONFIRMED
     │
     ├─ 5. Additional checks
-    │      Method bypass, param pollution, mass assignment,
+    │      Method bypass, param pollution, mass assignment
+    │        (mass assignment follow-up GET confirms ownership change),
     │      soft-delete bypass, blind IDOR
     │
-    └─ 6. Deduplicate + report
+    ├─ 6. Stored IDOR chaining (--chain-create / --chain-read)
+    │      Session A creates resource → harvest IDs from response
+    │      Session B reads via URL template → CONFIRMED if ownership leaks
+    │
+    └─ 7. Deduplicate + report
            Highest-confidence per (url, param, type)
            curl reproduction command on every finding
 ```

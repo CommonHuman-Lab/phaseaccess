@@ -8,8 +8,6 @@ Baseline response fingerprinting for false-positive reduction.
 Captures a "fingerprint" of the legitimate (owner's) response so the
 comparator can detect meaningful changes rather than reacting to noise
 like timestamps, session tokens, or CSRF values.
-
-Standalone-safe: stdlib only.
 """
 
 from __future__ import annotations
@@ -20,14 +18,13 @@ import json
 import logging
 import re
 import time
-import urllib.error
-import urllib.request as _req
 import urllib.parse as up
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from commonhuman_core.http import HttpClient
+
 from ._constants import OWNERSHIP_KEYS
-from .http_client import get_opener
 
 logger = logging.getLogger(__name__)
 
@@ -248,77 +245,46 @@ def _rebuild_with_extra_volatiles(
 
 
 def _fetch_fingerprint(
-  url:        str,
-  method:     str,
-  headers:    Dict[str, str],
-  body:       str,
-  cookies:    str,
-  proxy:      str,
-  timeout:    int,
-  verify_ssl: bool = True,
+    url:        str,
+    method:     str,
+    headers:    Dict[str, str],
+    body:       str,
+    cookies:    str,
+    proxy:      str,
+    timeout:    int,
+    verify_ssl: bool = True,
 ) -> Optional[ResponseFingerprint]:
-  """Make a single HTTP request and return a fingerprint."""
-  req_headers = dict(headers)
-  if cookies:
-    req_headers.setdefault('Cookie', cookies)
-  req_headers.setdefault('User-Agent', 'PhaseAccess/1.0')
+    """Make a single HTTP request and return a fingerprint."""
+    req_headers = dict(headers)
+    if cookies:
+        req_headers.setdefault("Cookie", cookies)
+    req_headers.setdefault("User-Agent", "PhaseAccess/1.0")
 
-  body_bytes = body.encode() if body else None
-
-  request = _req.Request(
-    url,
-    data=body_bytes,
-    headers=req_headers,
-    method=method,
-  )
-
-  opener = get_opener(proxy, verify_ssl)
-
-  t0 = time.time()
-  try:
-    with opener.open(request, timeout=timeout) as resp:
-      elapsed_ms = (time.time() - t0) * 1000
-      resp_body  = resp.read().decode('utf-8', errors='replace')
-      resp_headers: Dict[str, str] = dict(resp.headers)
-      status = resp.status
-
-    return fingerprint_response(
-      url=url,
-      method=method,
-      status=status,
-      body=resp_body,
-      headers=resp_headers,
-      elapsed_ms=elapsed_ms,
+    client = HttpClient(
+        timeout=timeout,
+        proxy=proxy,
+        headers=req_headers,
+        verify_ssl=verify_ssl,
+        delay=0.0,
     )
+    body_bytes = body.encode() if body else None
 
-  except urllib.error.HTTPError as exc:
-    # HTTP errors (4xx/5xx) are still valid fingerprint-able responses
+    t0 = time.time()
     try:
-      elapsed_ms = (time.time() - t0) * 1000
-      resp_body  = exc.read().decode('utf-8', errors='replace')
-      resp_headers = dict(exc.headers)
-      return fingerprint_response(
+        resp = client._session.request(method, url, data=body_bytes, timeout=timeout)
+    except Exception as exc:
+        logger.warning("Network error fetching %s: %s", url, exc)
+        return None
+
+    elapsed_ms = (time.time() - t0) * 1000
+    return fingerprint_response(
         url=url,
         method=method,
-        status=exc.code,
-        body=resp_body,
-        headers=resp_headers,
+        status=resp.status_code,
+        body=resp.text,
+        headers=dict(resp.headers),
         elapsed_ms=elapsed_ms,
-      )
-    except Exception as inner:
-      logger.debug("Failed to read HTTPError body for %s: %s", url, inner)
-      return None
-  except urllib.error.URLError as exc:
-    logger.warning("Network error fetching %s: %s", url, exc.reason)
-    return None
-  except ssl.SSLError as exc:
-    logger.warning(
-      "SSL error fetching %s: %s  (use --insecure to skip verification)", url, exc
     )
-    return None
-  except Exception as exc:
-    logger.debug("Unexpected error fetching %s: %s", url, exc)
-    return None
 
 
 # ---------------------------------------------------------------------------

@@ -26,10 +26,14 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: Security",
 ]
-dependencies = []
+dependencies = [
+  "requests>=2.28.0",
+  "commonhuman-cli>=0.1.0",
+  "commonhuman-core>=0.1.0",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov"]
+dev = ["pytest>=7", "pytest-cov", "pytest-mock>=3.0"]
 
 [project.scripts]
 phaseaccess = "phaseaccess.__main__:main"

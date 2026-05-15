@@ -225,6 +225,11 @@ def _scan_endpoint(
       for field_name, vals in harvested_pool.items():
         if vals:
           known_foreign.setdefault(field_name, vals[0])
+      # Direct access: session_b requests session_a's URL with session_a's ownership data visible
+      cross_finding = _check_direct_cross_session(url, baseline, b_baseline, opts)
+      if cross_finding:
+        partial.findings.append(cross_finding)
+        log(f"[+] CONFIRMED HORIZONTAL IDOR — session_b directly accessed session_a's resource @ {url}")
 
   # 3. Test each ref
   for ref in refs:
@@ -276,9 +281,13 @@ def _scan_endpoint(
         idor_type = _classify_idor_type(
           ref, cand.is_foreign, pair.is_dual, diff.verdict
         )
+        confidence = diff.confidence
+        # In dual-session mode, ownership field leakage is cross-user confirmed
+        if pair.is_dual and diff.leaked_fields and diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
+          confidence = Confidence.CONFIRMED
         finding = _make_finding(
           idor_type=idor_type,
-          confidence=diff.confidence,
+          confidence=confidence,
           location=ref.location,
           url=url,
           method=opts.method,
@@ -571,6 +580,60 @@ def _make_finding(
 
 
 
+# ---------------------------------------------------------------------------
+# Direct cross-session access check
+# ---------------------------------------------------------------------------
+
+def _check_direct_cross_session(
+  url:        str,
+  a_baseline: ResponseFingerprint,
+  b_baseline: ResponseFingerprint,
+  opts:       ScanOptions,
+) -> Optional[IDORFinding]:
+  """
+  Fundamental horizontal IDOR: session_b requests session_a's URL and gets
+  back session_a's ownership field values.  Works even when the comparator
+  misses it because both baselines look similar.
+  """
+  if a_baseline.status != 200 or b_baseline.status != 200:
+    return None
+
+  leaked = [
+    key for key, val in a_baseline.ownership_values.items()
+    if len(val) >= 8 and val in b_baseline.body
+  ]
+  if not leaked:
+    return None
+
+  from .extractor import extract_all as _extract
+  refs = _extract(url, opts.method)
+  first_ref = refs[0] if refs else None
+
+  return IDORFinding(
+    idor_type=IDORType.HORIZONTAL,
+    confidence=Confidence.CONFIRMED,
+    location=first_ref.location if first_ref else IDORLocation.PATH_SEGMENT,
+    url=url,
+    method=opts.method,
+    parameter=first_ref.param if first_ref else "[direct]",
+    id_type=first_ref.id_type if first_ref else IDType.UNKNOWN,
+    original_value=first_ref.value if first_ref else "",
+    tampered_value=first_ref.value if first_ref else "",
+    baseline_status=a_baseline.status,
+    tampered_status=b_baseline.status,
+    baseline_length=a_baseline.body_length,
+    tampered_length=b_baseline.body_length,
+    owner_fields_leaked=leaked,
+    evidence_snippet=b_baseline.body[:500],
+    session_a_label=opts.session_a_label,
+    session_b_label=opts.session_b_label,
+    notes=(
+      f"session_b directly accessed session_a's resource; "
+      f"ownership fields confirmed: {', '.join(leaked)}"
+    ),
+  )
+
+
 # Ownership field names we try to inject
 _MA_FIELDS = [
   "user_id", "owner_id", "account_id", "userId", "ownerId", "accountId",
@@ -635,6 +698,24 @@ def _check_mass_assignment(
   if injected_reflected and confidence not in (Confidence.CONFIRMED, Confidence.HIGH):
     confidence = Confidence.HIGH
 
+  notes = "mass assignment: injected ownership field accepted" + (
+    "; injected value reflected in response" if injected_reflected else ""
+  )
+
+  # Follow-up GET with session_a — confirm ownership actually changed
+  if pair.is_dual:
+    a_headers = dict(pair.headers_for('a'))
+    a_cookies = pair.cookies_for('a')
+    if a_cookies:
+      a_headers.setdefault('Cookie', a_cookies)
+    follow_fp = _do_single_request(
+      ref.url, 'GET', a_headers, "",
+      opts.proxy, opts.timeout, opts.verify_ssl, opts.delay,
+    )
+    if follow_fp and foreign_id in follow_fp.body:
+      confidence = Confidence.CONFIRMED
+      notes += "; ownership change confirmed (foreign_id visible in session_a GET)"
+
   return _make_finding(
     idor_type=IDORType.MASS_ASSIGNMENT,
     confidence=confidence,
@@ -648,9 +729,7 @@ def _check_mass_assignment(
     baseline=baseline,
     tampered_fp=fp,
     diff_result=diff,
-    notes="mass assignment: injected ownership field accepted" + (
-      "; injected value reflected in response" if injected_reflected else ""
-    ),
+    notes=notes,
     session_a_label=opts.session_a_label,
     session_b_label=opts.session_b_label,
   )

