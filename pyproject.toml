@@ -28,8 +28,8 @@ classifiers = [
 ]
 dependencies = [
   "requests>=2.28.0",
-  "commonhuman-cli>=0.1.0",
-  "commonhuman-core>=0.1.0",
+  "commonhuman-cli",
+  "commonhuman-core",
 ]
 
 [project.optional-dependencies]
