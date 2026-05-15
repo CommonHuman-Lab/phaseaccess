@@ -25,7 +25,7 @@ class TestSession:
     assert h["X-Role"] == "admin"
 
   def test_effective_headers_sets_user_agent_default(self):
-    from phaseaccess.engine.session import _UA_POOL
+    from commonhuman_core.http.client import _UA_POOL
     s = Session(label="test")
     h = s.effective_headers()
     assert "User-Agent" in h

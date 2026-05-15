@@ -460,7 +460,8 @@ def _run_param_pollution(
 # ---------------------------------------------------------------------------
 
 def _build_session_pair(opts: ScanOptions) -> SessionPair:
-  from .session import Session, random_ua
+  from .session import Session
+  from commonhuman_core.http import random_ua
   raw_ua = opts.user_agent or "random"
   ua = random_ua() if raw_ua.lower() == "random" else raw_ua
 
