@@ -310,7 +310,17 @@ Target URL(s)
 
 ---
 
-## 📜 License
+## Legal & Ethical Use
+
+Only run PhaseAccess against applications you own or have explicit written authorization to test. Authorized use includes penetration testing engagements, bug bounty programs within defined scope, and CTF competitions.
+
+In dual-session mode, only supply credentials for accounts you control or that belong to users who have consented as part of the authorized test.
+
+The authors accept no liability for unauthorized or illegal use.
+
+---
+
+## License
 
 Licensed under the [AGPLv3](LICENSE).
 You are free to use, modify, and distribute this software. If you run it as a service or distribute it, the source must remain open.
