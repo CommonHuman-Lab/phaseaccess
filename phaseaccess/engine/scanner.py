@@ -86,8 +86,23 @@ class ScanOptions:
   # Extra endpoints to test (in addition to the primary target)
   extra_urls: List[str] = field(default_factory=list)
 
+  # Form endpoints discovered by the crawler (each carries its own method + body)
+  form_scan_targets: List["FormScanTarget"] = field(default_factory=list)
+
+  # Per-path-prefix auth header overrides populated by --auto-login
+  url_auth_overrides_a: Dict[str, Dict[str, str]] = field(default_factory=dict)
+  url_auth_overrides_b: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
   # Callback for live progress
   on_log: Optional[Callable[[str], None]] = None
+
+
+@dataclass
+class FormScanTarget:
+  """A form-based endpoint discovered by the crawler with its own method and body."""
+  url:    str
+  method: str = "POST"
+  body:   str = ""  # URL-encoded or JSON body
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +125,18 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
   # Build session pair
   session_pair = _build_session_pair(opts)
 
-  all_urls = [target] + (opts.extra_urls or [])
-  log(f"[*] PhaseAccess starting — {len(all_urls)} endpoint(s)")
+  # Build per-target list, applying URL-specific auth and method/body overrides
+  _all_targets: List[tuple] = []
+  for _u in [target] + (opts.extra_urls or []):
+    _t_opts = _apply_url_opts(_u, opts)
+    _t_pair = session_pair if _t_opts is opts else _build_session_pair(_t_opts)
+    _all_targets.append((_u, _t_opts, _t_pair))
+  for _ft in (opts.form_scan_targets or []):
+    _t_opts = _apply_url_opts(_ft.url, opts, method=_ft.method, body=_ft.body)
+    _t_pair = session_pair if _t_opts is opts else _build_session_pair(_t_opts)
+    _all_targets.append((_ft.url, _t_opts, _t_pair))
+
+  log(f"[*] PhaseAccess starting — {len(_all_targets)} endpoint(s)")
   log(f"[*] Mode: {'dual-session' if session_pair.is_dual else 'single-session'}")
   if not opts.verify_ssl:
     log("[!] SSL certificate verification disabled (--insecure)")
@@ -124,9 +149,9 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
     futures = {
       pool.submit(
         _scan_endpoint,
-        url, opts, session_pair, harvested_pool, harvested_lock, log,
-      ): url
-      for url in all_urls
+        _url, _t_opts, _t_pair, harvested_pool, harvested_lock, log,
+      ): _url
+      for _url, _t_opts, _t_pair in _all_targets
     }
     for future in concurrent.futures.as_completed(futures):
       url = futures[future]
@@ -197,14 +222,49 @@ def _scan_endpoint(
 
   # 2. Extract object refs
   refs = extract_all(url, opts.method, opts.body, pair.headers_for('a'))
-  if not refs:
-    log(f"[~] No object references found in {url}")
-    return partial
 
-  partial.endpoints_tested = 1
-  log(f"[~] Found {len(refs)} object ref(s) in {url}")
+  # Error-driven param discovery: 400/422 → extract required field names and retry once
+  if baseline.status in (400, 422) and not refs:
+    for _epname, _epval in _extract_error_params(baseline.body):
+      if opts.method.upper() in ("GET", "HEAD", "DELETE"):
+        _ep_url = _url_append_param(url, _epname, str(_epval))
+        _ep_retry = build_baseline(
+          url=_ep_url, method=opts.method, headers=pair.headers_for('a'),
+          body=opts.body, cookies=pair.cookies_for('a'), proxy=opts.proxy,
+          timeout=opts.timeout, verify_ssl=opts.verify_ssl, delay=opts.delay,
+        )
+        partial.requests_sent += 1
+        if _ep_retry and _ep_retry.status == 200:
+          url = _ep_url
+          baseline = _ep_retry
+          refs = extract_all(url, opts.method, opts.body, pair.headers_for('a'))
+          log(f"[~] Error-driven discovery: retrying with ?{_epname}={_epval} → 200")
+          break
+      else:
+        try:
+          _ep_bd: dict = _json.loads(opts.body) if opts.body else {}
+        except Exception:
+          _ep_bd = {}
+        if _epname not in _ep_bd:
+          _ep_bd[_epname] = _epval
+          _ep_body = _json.dumps(_ep_bd)
+          _ep_retry = build_baseline(
+            url=url, method=opts.method,
+            headers={**pair.headers_for('a'), 'Content-Type': 'application/json'},
+            body=_ep_body, cookies=pair.cookies_for('a'), proxy=opts.proxy,
+            timeout=opts.timeout, verify_ssl=opts.verify_ssl, delay=opts.delay,
+          )
+          partial.requests_sent += 1
+          if _ep_retry and _ep_retry.status == 200:
+            baseline = _ep_retry
+            opts = _apply_url_opts(url, opts, body=_ep_body)
+            refs = extract_all(url, opts.method, opts.body, pair.headers_for('a'))
+            log(f"[~] Error-driven discovery: POST body {_ep_body[:60]} → 200")
+            break
 
-  # Known foreign values from session_b's harvest (for cross-session confirmation)
+  # Dual-session cross-session check — deliberately placed BEFORE the no-refs early
+  # return so that endpoints with no extractable params (e.g. /user/settings) are
+  # still checked for direct ownership-field leakage across sessions.
   known_foreign: Dict[str, str] = {}
   if pair.is_dual and pair.session_b:
     b_baseline = build_baseline(
@@ -231,6 +291,13 @@ def _scan_endpoint(
         partial.findings.append(cross_finding)
         log(f"[+] CONFIRMED HORIZONTAL IDOR — session_b directly accessed session_a's resource @ {url}")
 
+  if not refs:
+    log(f"[~] No object references found in {url}")
+    return partial
+
+  partial.endpoints_tested = 1
+  log(f"[~] Found {len(refs)} object ref(s) in {url}")
+
   # 3. Test each ref
   for ref in refs:
     partial.parameters_tested += 1
@@ -247,6 +314,7 @@ def _scan_endpoint(
       ref.id_type,
       foreign_ids=foreign_ids or None,
       count=opts.max_candidates,
+      url=ref.url,
     )
 
     for cand in candidates:
@@ -485,6 +553,99 @@ def _build_session_pair(opts: ScanOptions) -> SessionPair:
       cookies=opts.session_b_cookies,
     )
   return SessionPair(session_a=session_a, session_b=session_b)
+
+
+def _find_override(url: str, overrides: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+  """Return headers from the longest matching path-prefix key in overrides, or {}."""
+  path = _up.urlparse(url).path
+  best_len, best = 0, {}
+  for prefix, hdrs in overrides.items():
+    if path.startswith(prefix) and len(prefix) > best_len:
+      best_len, best = len(prefix), hdrs
+  return best
+
+
+def _apply_url_opts(
+  url:    str,
+  opts:   ScanOptions,
+  method: Optional[str] = None,
+  body:   Optional[str] = None,
+) -> ScanOptions:
+  """Return a copy of opts with URL-specific overrides applied, or opts itself if none."""
+  import copy as _copy
+  ov_a = _find_override(url, opts.url_auth_overrides_a)
+  ov_b = _find_override(url, opts.url_auth_overrides_b)
+  if not ov_a and not ov_b and not method and body is None:
+    return opts
+  new = _copy.copy(opts)
+  if ov_a:
+    new.session_a_headers = {**opts.session_a_headers, **ov_a}
+  if ov_b:
+    new.session_b_headers = {**opts.session_b_headers, **ov_b}
+  if method:
+    new.method = method
+  if body is not None:
+    new.body = body
+  return new
+
+
+def _extract_error_params(body: str) -> list:
+  """
+  Parse a 400/422 response body for required field names.
+  Handles:
+    {"error": "report_id (integer) required"}
+    {"detail": [{"loc": ["body", "resource_id"], "msg": "field required"}]}
+  Returns list of (field_name, probe_value) tuples.
+  """
+  import re as _re_ep
+  _FIELD_TYPE_RE = _re_ep.compile(
+    r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\((?:integer|string|int|str|number|uuid|float)\)',
+    _re_ep.I,
+  )
+  _BLACKLIST = frozenset({"true", "false", "null", "error", "msg", "message", "detail"})
+
+  results: list = []
+  seen: set = set()
+
+  def _add(name: str, val: object = 1) -> None:
+    if name not in seen and name.lower() not in _BLACKLIST and len(name) > 1:
+      seen.add(name)
+      results.append((name, val))
+
+  try:
+    data = _json.loads(body)
+    detail = data.get("detail")
+    if isinstance(detail, list):
+      for item in detail:
+        if isinstance(item, dict):
+          loc = item.get("loc", [])
+          if loc:
+            fname = str(loc[-1])
+            if fname not in ("body", "query", "path"):
+              _add(fname)
+      if results:
+        return results
+    for key in ("error", "message", "msg", "description", "errors"):
+      v = data.get(key)
+      if isinstance(v, str):
+        for m in _FIELD_TYPE_RE.finditer(v):
+          _add(m.group(1))
+        if results:
+          return results
+  except Exception:
+    pass
+
+  for m in _FIELD_TYPE_RE.finditer(body):
+    _add(m.group(1))
+  return results
+
+
+def _url_append_param(url: str, param: str, value: str) -> str:
+  """Append ?param=value to a URL, preserving existing query params."""
+  p = _up.urlparse(url)
+  qs = _up.parse_qsl(p.query, keep_blank_values=True)
+  qs.append((param, value))
+  return _up.urlunparse(p._replace(query=_up.urlencode(qs)))
 
 
 def _deduplicate_findings(findings: List[IDORFinding]) -> List[IDORFinding]:

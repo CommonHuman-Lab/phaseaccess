@@ -19,6 +19,7 @@ Options:
     --login-url-b        Login form URL for session B
     --login-user-b       Username for session B form login
     --login-pass-b       Password for session B form login
+    --auto-login         Auto-discover login endpoints during --crawl; authenticate both sessions
     --openapi            OpenAPI/Swagger spec file path or URL — imports endpoints
     --base-url           Base URL override for OpenAPI spec (overrides spec servers)
     --chain-create       Stored IDOR: session_a creates resource here (e.g. POST:/api/items)
@@ -247,6 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Username for session B form login")
     p.add_argument("--login-pass-b", default="", dest="login_pass_b",
                    help="Password for session B form login")
+    p.add_argument("--auto-login", action="store_true", dest="auto_login",
+                   help="Auto-discover login endpoints during --crawl and authenticate both sessions")
     p.add_argument("--openapi", default="", dest="openapi",
                    help="OpenAPI/Swagger spec file path or URL")
     p.add_argument("--base-url", default="", dest="base_url",
@@ -410,6 +413,10 @@ def main() -> None:
         if not args.quiet and not args.json_output:
             print(DIM(f"[*] OpenAPI: {len(api_endpoints)} endpoint(s) queued"))
 
+    url_auth_overrides_a: dict = {}
+    url_auth_overrides_b: dict = {}
+    form_scan_targets_raw: list = []
+
     if getattr(args, "crawl", False) and args.url:
         from commonhuman_core.http import HttpClient
         from commonhuman_core.crawler import crawl as _crawl
@@ -434,8 +441,163 @@ def main() -> None:
         seen = {args.url} | set(combined_extra_urls)
         discovered = [u for u in crawl_result.visited_urls if u not in seen and not _validate_extra_url(u)]
         combined_extra_urls.extend(discovered)
+        seen.update(discovered)
+
+        # Mine JS string literals in page bodies for API paths the link-follower
+        # can't reach (e.g. endpoints only referenced inside fetch() calls).
+        import re as _re
+        import urllib.parse as _up
+        _js_path_re = _re.compile(
+            r"""['"](/(?:[A-Za-z0-9_\-]+/){2,}[A-Za-z0-9_\-]+(?:\?[^'"<\s]*)?)['"]"""
+        )
+        _static_ext_re = _re.compile(r'\.(css|js|png|jpg|gif|svg|ico|woff|ttf|map)$', _re.I)
+        _parsed = _up.urlparse(args.url)
+        _origin = f"{_parsed.scheme}://{_parsed.netloc}"
+        _js_found = 0
+        for _html in crawl_result.page_sources.values():
+            for _m in _js_path_re.finditer(_html):
+                _path = _m.group(1)
+                if _static_ext_re.search(_path.split('?')[0]):
+                    continue
+                _full = _origin + _path
+                if _full not in seen and not _validate_extra_url(_full):
+                    combined_extra_urls.append(_full)
+                    seen.add(_full)
+                    _js_found += 1
+
+        # Pass 2: Template URL resolution — {id}/{oid}/{param} → probe value "1"
+        _TMPL_PATH_RE = _re.compile(
+            r"""['"](/(?:[A-Za-z0-9_\-]+/){1,}[A-Za-z0-9_\-]*\{[A-Za-z][A-Za-z0-9_]*\}[^"'<\s]*)['"]"""
+        )
+        _PLACEHOLDER_RE = _re.compile(r'\{[A-Za-z][A-Za-z0-9_]*\}')
+        _tmpl_found = 0
+        for _html in crawl_result.page_sources.values():
+            for _tm in _TMPL_PATH_RE.finditer(_html):
+                _probe_path = _PLACEHOLDER_RE.sub('1', _tm.group(1))
+                _probe_full = _origin + _probe_path
+                if _probe_full not in seen and not _validate_extra_url(_probe_full):
+                    combined_extra_urls.append(_probe_full)
+                    seen.add(_probe_full)
+                    _tmpl_found += 1
+
+        # Pass 3: Obfuscated ID reconstruction — {oid} template + literal value on same page
+        _OID_TMPL_RE = _re.compile(r'/(?:[A-Za-z0-9_\-]+/){2,}[A-Za-z0-9_\-]*\{oid\}')
+        _UUID_RE     = _re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', _re.I)
+        _HEX32_RE    = _re.compile(r'\b[0-9a-f]{32}\b')
+        _B64_RE      = _re.compile(r"'([A-Za-z0-9+/]{8,}={1,2})'")
+        for _page_url, _html in crawl_result.page_sources.items():
+            _oid_tmpl_m = _OID_TMPL_RE.search(_html)
+            if not _oid_tmpl_m:
+                continue
+            _oid_tmpl = _oid_tmpl_m.group()
+            _oid_vals = (
+                _UUID_RE.findall(_html)
+                + _HEX32_RE.findall(_html)
+                + [m.group(1) for m in _B64_RE.finditer(_html)]
+            )
+            for _oid_val in dict.fromkeys(_oid_vals):
+                if len(_oid_val) < 8:
+                    continue
+                _oid_url = _origin + _oid_tmpl.replace('{oid}', _oid_val)
+                if _oid_url not in seen and not _validate_extra_url(_oid_url):
+                    combined_extra_urls.append(_oid_url)
+                    seen.add(_oid_url)
+                    _tmpl_found += 1
+
+        # Pass 4: Pollution param — reconstruct single-param baseline from duplicate-param examples
+        _DUPE_PARAM_RE = _re.compile(
+            r'(/[A-Za-z0-9_/\-]+\?([A-Za-z_][A-Za-z0-9_]*)=([0-9]+)(?:&\2=[0-9]+)+)'
+        )
+        for _html in crawl_result.page_sources.values():
+            for _pm in _DUPE_PARAM_RE.finditer(_html):
+                _base_path = _pm.group(1).split('?')[0]
+                _pname     = _pm.group(2)
+                _pvals     = _re.findall(rf'{_pname}=([0-9]+)', _pm.group(1))
+                for _pv in dict.fromkeys([_pvals[0], _pvals[-1]]):
+                    _clean_url = _origin + _base_path + f'?{_pname}={_pv}'
+                    if _clean_url not in seen and not _validate_extra_url(_clean_url):
+                        combined_extra_urls.append(_clean_url)
+                        seen.add(_clean_url)
+                        _tmpl_found += 1
+
+        # Pass 5: path_param_candidates — URLs with numeric segments that returned 403/404
+        _ppc_found = 0
+        for _ppc in (getattr(crawl_result, 'path_param_candidates', []) or []):
+            if _ppc not in seen and not _validate_extra_url(_ppc):
+                combined_extra_urls.append(_ppc)
+                seen.add(_ppc)
+                _ppc_found += 1
+
         if not args.quiet and not args.json_output:
-            print(DIM(f"[*] Crawl complete — {len(discovered)} additional endpoint(s) queued"))
+            print(DIM(
+                f"[*] Crawl complete — {len(discovered)} link(s), {_js_found} JS path(s), "
+                f"{_tmpl_found} template/obfusc(s), {_ppc_found} 403-candidate(s) queued"
+            ))
+
+        # Auto-login: find login-like endpoints discovered during crawl, auth both sessions
+        if getattr(args, "auto_login", False) and (args.login_user or args.login_user_b):
+            import re as _re_al
+            _login_re = _re_al.compile(r'/(login|auth|signin)/?$', _re_al.I)
+            _user_a = args.login_user or ""
+            _pass_a = getattr(args, "login_pass", "")
+            _user_b = args.login_user_b or _user_a
+            _pass_b = getattr(args, "login_pass_b", "") or _pass_a
+            _ufield = getattr(args, "login_user_field", "username")
+            _pfield = getattr(args, "login_pass_field", "password")
+
+            def _try_login_url(lurl: str, user: str, passwd: str) -> dict:
+                """Try form login then JSON POST fallback; return Authorization header dict."""
+                from commonhuman_core.auth import form_login as _fl
+                _r = _fl(lurl, user, passwd, username_field=_ufield, password_field=_pfield)
+                if not _r.is_empty():
+                    return _r.headers
+                try:
+                    import requests as _rq
+                    _jr = _rq.post(lurl, json={_ufield: user, _pfield: passwd}, timeout=10)
+                    _j = _jr.json()
+                    for _k in ("token", "access_token", "accessToken", "jwt", "id_token"):
+                        if _k in _j and isinstance(_j[_k], str):
+                            return {"Authorization": f"Bearer {_j[_k]}"}
+                except Exception:
+                    pass
+                return {}
+
+            _seen_prefixes: set = set()
+            for _lurl in list(crawl_result.visited_urls) + combined_extra_urls:
+                _lpath = _up.urlparse(_lurl).path
+                if not _login_re.search(_lpath):
+                    continue
+                _prefix = _lpath.rsplit("/", 1)[0]
+                if _prefix in _seen_prefixes:
+                    continue
+                _seen_prefixes.add(_prefix)
+                if not args.quiet and not args.json_output:
+                    print(DIM(f"[*] Auto-login: trying {_lurl}"))
+                # A short prefix (≤1 path segment) means a site-wide login —
+                # apply the token globally so no manual -H flags are needed.
+                _is_global = len([s for s in _prefix.split("/") if s]) <= 1
+                if _user_a:
+                    _ha = _try_login_url(_lurl, _user_a, _pass_a)
+                    if _ha:
+                        if _is_global:
+                            session_a_headers.update(_ha)
+                        else:
+                            url_auth_overrides_a[_prefix] = _ha
+                        if not args.quiet and not args.json_output:
+                            _scope = "global" if _is_global else _prefix
+                            print(DIM(f"[*]   Session A authenticated ({_scope})"))
+                if _user_b:
+                    _hb = _try_login_url(_lurl, _user_b, _pass_b)
+                    if _hb:
+                        if _is_global:
+                            session_b_headers.update(_hb)
+                        else:
+                            url_auth_overrides_b[_prefix] = _hb
+                        if not args.quiet and not args.json_output:
+                            _scope = "global" if _is_global else _prefix
+                            print(DIM(f"[*]   Session B authenticated ({_scope})"))
+
+        form_scan_targets_raw = crawl_result.form_targets
 
     # Browser crawl (JS-rendered endpoint discovery)
     if getattr(args, "browser_crawl", False) and args.url:
@@ -456,6 +618,21 @@ def main() -> None:
         combined_extra_urls.extend(new_bc)
         if not args.quiet and not args.json_output:
             print(DIM(f"[*] Browser crawl: {len(new_bc)} additional endpoint(s) queued"))
+
+    # Convert crawler FormTarget objects to scanner FormScanTarget objects (dedup by action+method)
+    from phaseaccess.engine.scanner import FormScanTarget as _FormScanTarget
+    import urllib.parse as _up_form
+    form_scan_targets: list = []
+    _seen_form_keys: set = set()
+    for _ft in form_scan_targets_raw:
+        _fkey = (_ft.action, _ft.method)
+        if _fkey in _seen_form_keys:
+            continue
+        _seen_form_keys.add(_fkey)
+        _fbody = _up_form.urlencode({**_ft.base_data, **_ft.params})
+        form_scan_targets.append(_FormScanTarget(url=_ft.action, method=_ft.method, body=_fbody))
+    if form_scan_targets and not args.quiet and not args.json_output:
+        print(DIM(f"[*] Form targets: {len(form_scan_targets)} form endpoint(s) queued"))
 
     def live_log(msg: str) -> None:
         if args.quiet or args.json_output:
@@ -490,6 +667,9 @@ def main() -> None:
         soft_delete=not args.no_soft_delete,
         blind_idor=not args.no_blind_idor,
         extra_urls=combined_extra_urls,
+        form_scan_targets=form_scan_targets,
+        url_auth_overrides_a=url_auth_overrides_a,
+        url_auth_overrides_b=url_auth_overrides_b,
         user_agent=getattr(args, "user_agent", "") or "random",
         on_log=live_log,
     )
