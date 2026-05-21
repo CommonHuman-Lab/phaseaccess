@@ -528,10 +528,54 @@ def main() -> None:
                 seen.add(_ppc)
                 _ppc_found += 1
 
+        # Pass 6: Param-value hint mining — extract `param=BIG_NUM` and
+        # `"param": BIG_NUM` from description pages and probe known
+        # API endpoints under the same path prefix with those values.
+        # Catches body-IDOR that embed the valid resource ID in
+        _PVHINT_RE = _re.compile(
+            r'\b([A-Za-z_][A-Za-z0-9_]{2,})["\']?\s*[=:]\s*["\']?(\d{3,})\b'
+        )
+        _CSS_PROPS = frozenset({
+            'width', 'height', 'padding', 'margin', 'top', 'bottom', 'left',
+            'right', 'size', 'weight', 'opacity', 'border', 'font', 'line',
+            'min', 'max', 'gap', 'flex', 'order', 'index', 'zindex',
+        })
+        _pv_found = 0
+        for _pg_url, _pg_html in crawl_result.page_sources.items():
+            _pg_prefix = _up.urlparse(_pg_url).path
+            _page_hints: dict = {}
+            for _m in _PVHINT_RE.finditer(_pg_html):
+                _pn = _m.group(1)
+                if _pn.lower() in _CSS_PROPS:
+                    continue
+                _pv_val = _m.group(2)
+                # Only keep if param looks like an API field, not a CSS/layout value
+                if not any(kw in _pn.lower() for kw in ('id', 'num', 'key', 'ref', 'record', 'report', 'resource', 'message', 'msg', 'doc')):
+                    continue
+                _page_hints[_pn] = _pv_val
+
+            if not _page_hints:
+                continue
+
+            for _pv_url in list(combined_extra_urls):
+                _pv_path = _up.urlparse(_pv_url).path
+                if not _pv_path.startswith(_pg_prefix):
+                    continue
+                _pv_existing_keys = {k for k, _ in _up.parse_qsl(_up.urlparse(_pv_url).query)}
+                for _pn, _pv_val in _page_hints.items():
+                    if _pn in _pv_existing_keys:
+                        continue
+                    _probe_url = _pv_url.split('?')[0] + f'?{_pn}={_pv_val}'
+                    if _probe_url not in seen and not _validate_extra_url(_probe_url):
+                        combined_extra_urls.append(_probe_url)
+                        seen.add(_probe_url)
+                        _pv_found += 1
+
         if not args.quiet and not args.json_output:
             print(DIM(
                 f"[*] Crawl complete — {len(discovered)} link(s), {_js_found} JS path(s), "
-                f"{_tmpl_found} template/obfusc(s), {_ppc_found} 403-candidate(s) queued"
+                f"{_tmpl_found} template/obfusc(s), {_ppc_found} 403-candidate(s), "
+                f"{_pv_found} param-hint URL(s) queued"
             ))
 
         # Auto-login: find login-like endpoints discovered during crawl, auth both sessions
