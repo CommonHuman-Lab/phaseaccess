@@ -377,6 +377,9 @@ def main() -> None:
         if auth_b.cookies and not args.cookie_b:
             args.cookie_b = auth_b.cookies
         session_b_headers.update(auth_b.headers)
+        # Auto-enable dual-session when session B authenticated successfully
+        if (auth_b.cookies or auth_b.headers) and not args.label_b:
+            args.label_b = "session_b"
 
     imported_extra_urls: list[str] = []
     if getattr(args, "targets", ""):
