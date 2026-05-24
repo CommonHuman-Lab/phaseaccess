@@ -127,6 +127,12 @@ def fingerprint_response(
   stable_hash  = hashlib.sha256(stable.encode()).hexdigest()[:16]
   json_keys, ownership, structure_sig = _analyse_json(body, content_type)
 
+  # Supplement with HTML-extracted PII when JSON parsing found nothing.
+  # This enables CONFIRMED verdicts on HTML pages whose responses change
+  # ownership-identifying values (SSN, email, etc.) between tamper targets.
+  if not ownership and 'html' in content_type:
+    ownership = _extract_html_ownership(body)
+
   return ResponseFingerprint(
     url=url,
     method=method,
@@ -346,6 +352,38 @@ def _get_header(headers: Dict[str, str], key: str, default: str = "") -> str:
     if k.lower() == key.lower():
       return v
   return default
+
+
+_EMAIL_RE = re.compile(r'\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b')
+_SSN_RE   = re.compile(r'\b(\d{3}-\d{2}-\d{4})\b')
+_INS_RE   = re.compile(r'\b([A-Z]{2,}-\d{4,})\b')
+# Require separators (-, ., space, or parens) so we don't match plain integers
+# like trading volumes that happen to be 10 digits long.
+_PHONE_RE = re.compile(
+  r'\b(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4})\b'
+)
+
+def _extract_html_ownership(body: str) -> Dict[str, str]:
+  """
+  Regex-scan an HTML body for PII-like ownership markers: emails, SSNs,
+  insurance/account IDs, and phone numbers.  Returns the first match per
+  category keyed by a stable field name — enough to confirm cross-user
+  leakage when these values change between baseline and tampered responses.
+  """
+  result: Dict[str, str] = {}
+  m = _EMAIL_RE.search(body)
+  if m:
+    result['email'] = m.group(1)
+  m = _SSN_RE.search(body)
+  if m:
+    result['ssn'] = m.group(1)
+  m = _INS_RE.search(body)
+  if m:
+    result['insurance_id'] = m.group(1)
+  m = _PHONE_RE.search(body)
+  if m:
+    result['phone'] = m.group(1).strip()
+  return result
 
 
 def _analyse_json(
