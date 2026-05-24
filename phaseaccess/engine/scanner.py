@@ -142,6 +142,38 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
   if not opts.verify_ssl:
     log("[!] SSL certificate verification disabled (--insecure)")
 
+  # Pre-compute session B's own identity values so we can exclude them from
+  # cross-session CONFIRMED verdicts.  Without this, the check fires a false
+  # positive whenever session B happens to be the resource owner at session A's
+  # URL (e.g. patient.john at /patients/1 — B's own record, not an IDOR).
+  #
+  # We probe a handful of well-known "own" paths; the first few that return 200
+  # with extractable ownership values are enough.
+  session_b_identity: Dict[str, str] = {}
+  if session_pair.is_dual:
+    import urllib.parse as _up2
+    _parsed_target = _up2.urlparse(target)
+    _origin = f"{_parsed_target.scheme}://{_parsed_target.netloc}"
+    _own_paths = ["", "/", "/dashboard", "/profile", "/me", "/account", "/home"]
+    for _own_path in _own_paths:
+      _own_url = _origin + _own_path
+      _own_fp = build_baseline(
+        url=_own_url,
+        method="GET",
+        headers=session_pair.headers_for("b"),
+        cookies=session_pair.cookies_for("b"),
+        proxy=opts.proxy,
+        timeout=opts.timeout,
+        verify_ssl=opts.verify_ssl,
+        repeats=1,
+      )
+      if _own_fp and _own_fp.status == 200 and _own_fp.ownership_values:
+        session_b_identity.update(_own_fp.ownership_values)
+        if len(session_b_identity) >= 3:
+          break
+    if session_b_identity:
+      log(f"[*] Session B identity harvested: {list(session_b_identity.keys())}")
+
   # Harvested IDs from session_a responses (for ID chaining)
   harvested_pool: Dict[str, List[str]] = {}
   harvested_lock = threading.Lock()
@@ -151,6 +183,7 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
       pool.submit(
         _scan_endpoint,
         _url, _t_opts, _t_pair, harvested_pool, harvested_lock, log,
+        session_b_identity,
       ): _url
       for _url, _t_opts, _t_pair in _all_targets
     }
@@ -187,12 +220,13 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
 # ---------------------------------------------------------------------------
 
 def _scan_endpoint(
-  url:           str,
-  opts:          ScanOptions,
-  pair:          SessionPair,
-  harvested_pool: Dict[str, List[str]],
-  harvested_lock: threading.Lock,
-  log:           Callable[[str], None],
+  url:               str,
+  opts:              ScanOptions,
+  pair:              SessionPair,
+  harvested_pool:    Dict[str, List[str]],
+  harvested_lock:    threading.Lock,
+  log:               Callable[[str], None],
+  session_b_identity: Optional[Dict[str, str]] = None,
 ) -> ScanResult:
   """Scan a single endpoint and return a partial ScanResult."""
   partial = ScanResult(target=url)
@@ -286,10 +320,12 @@ def _scan_endpoint(
         if vals:
           known_foreign.setdefault(field_name, vals[0])
       # Direct access: session_b requests session_a's URL with session_a's ownership data visible
-      cross_finding = _check_direct_cross_session(url, baseline, b_baseline, opts)
+      cross_finding = _check_direct_cross_session(
+        url, baseline, b_baseline, opts, session_b_identity or {}
+      )
       if cross_finding:
         partial.findings.append(cross_finding)
-        log(f"[+] CONFIRMED HORIZONTAL IDOR — session_b directly accessed session_a's resource @ {url}")
+        log(f"[+] {cross_finding.confidence} {cross_finding.idor_type} — cross-session @ {url}")
 
   if not refs:
     log(f"[~] No object references found in {url}")
@@ -762,10 +798,11 @@ def _make_finding(
 # ---------------------------------------------------------------------------
 
 def _check_direct_cross_session(
-  url:        str,
-  a_baseline: ResponseFingerprint,
-  b_baseline: ResponseFingerprint,
-  opts:       ScanOptions,
+  url:                str,
+  a_baseline:         ResponseFingerprint,
+  b_baseline:         ResponseFingerprint,
+  opts:               ScanOptions,
+  session_b_identity: Dict[str, str] = {},
 ) -> Optional[IDORFinding]:
   """
   Cross-session checks on session_a's URL:
@@ -778,11 +815,15 @@ def _check_direct_cross_session(
   refs = extract_all(url, opts.method)
   first_ref = refs[0] if refs else None
 
-  # Case 1: horizontal IDOR — both sessions get 200, B sees A's ownership data
+  # Case 1: horizontal IDOR — both sessions get 200, B sees A's ownership data.
+  # Values that belong to session B's own identity are excluded — if B is the
+  # legitimate owner of a resource (e.g. /resource/1 belongs to user B), those
+  # values appearing in B's response are not evidence of cross-user leakage.
   if a_baseline.status == 200 and b_baseline.status == 200:
+    b_own_values = set(session_b_identity.values())
     leaked = [
       key for key, val in a_baseline.ownership_values.items()
-      if len(val) >= 8 and val in b_baseline.body
+      if len(val) >= 8 and val in b_baseline.body and val not in b_own_values
     ]
     if not leaked:
       return None
