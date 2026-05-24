@@ -200,8 +200,11 @@ def generate_candidates(
     # Unknown — try generic mutations
     candidates.extend(_generic_candidates(value))
 
-  # Always test null/zero/admin edge cases
-  candidates.extend(_universal_candidates())
+  # Universal edge cases — skip for JWT (garbage values cause false positives
+  # on public pages when sent as session cookies: the logged-out HTML differs
+  # from the logged-in HTML, triggering body-hash changes with no real IDOR).
+  if id_type != IDType.JWT:
+    candidates.extend(_universal_candidates())
 
   # Deduplicate preserving order, skip original value
   seen  = {value}
@@ -643,6 +646,10 @@ def _generic_candidates(value: str) -> List[TamperCandidate]:
 
 def _universal_candidates() -> List[TamperCandidate]:
   """Edge cases that apply regardless of ID type."""
+  # NOTE: these are only useful for non-JWT types. For JWT/cookie locations the
+  # garbage values (null, *, ../) cause public pages to return logged-out HTML
+  # with slightly different content — generating false positives without any
+  # real IDOR signal. They are filtered out for IDType.JWT in generate_candidates.
   return [
     TamperCandidate("*",      "wildcard"),
     TamperCandidate("%2A",    "URL-encoded wildcard"),

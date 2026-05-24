@@ -26,6 +26,7 @@ from __future__ import annotations
 import concurrent.futures
 import json as _json
 import logging
+import re
 import threading
 import time
 import urllib.parse as _up
@@ -210,7 +211,6 @@ def _scan_endpoint(
     delay=opts.delay,
   )
   if baseline is None:
-    partial.errors.append(f"Baseline fetch failed: {url}")
     return partial
 
   partial.requests_sent += 1
@@ -343,6 +343,7 @@ def _scan_endpoint(
         baseline=baseline,
         tampered=tamper_result.fingerprint,
         known_foreign_values=known_foreign or None,
+        is_dual=pair.is_dual,
       )
 
       if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY, DiffVerdict.POSSIBLE):
@@ -458,7 +459,7 @@ def _run_method_bypass(
   )
   partial.requests_sent += len(method_results)
   for mr in method_results:
-    diff = compare(baseline, mr.fingerprint, known_foreign or None)
+    diff = compare(baseline, mr.fingerprint, known_foreign or None, is_dual=pair.is_dual)
     if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
       partial.findings.append(_make_finding(
         idor_type=IDORType.METHOD_BYPASS,
@@ -502,7 +503,7 @@ def _run_param_pollution(
   )
   partial.requests_sent += 1
   if pp_result:
-    diff = compare(baseline, pp_result.fingerprint, known_foreign or None)
+    diff = compare(baseline, pp_result.fingerprint, known_foreign or None, is_dual=pair.is_dual)
     if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
       partial.findings.append(_make_finding(
         idor_type=IDORType.PARAM_POLLUTION,
@@ -648,26 +649,35 @@ def _url_append_param(url: str, param: str, value: str) -> str:
   return _up.urlunparse(p._replace(query=_up.urlencode(qs)))
 
 
+_NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$)')
+
+def _url_template(url: str) -> str:
+  """Replace numeric path segments with {id} for deduplication."""
+  parsed = _up.urlparse(url)
+  path = _NUMERIC_SEG_RE.sub('/{id}', parsed.path)
+  return _up.urlunparse(parsed._replace(path=path, query=''))
+
+
 def _deduplicate_findings(findings: List[IDORFinding]) -> List[IDORFinding]:
   """
-  For each (url, parameter, idor_type) tuple keep only the finding with the
-  highest confidence.  Preserves original order (first occurrence wins on tie).
+  Keep only the highest-confidence finding per (url_template, parameter, idor_type).
+  URL templates collapse numeric segments so /admin/users/1 and /admin/users/2
+  are treated as the same finding.
   """
   def _rank(c: str) -> int:
     return CONFIDENCE_RANK.get(c, len(CONFIDENCE_RANK))
 
   best: Dict[tuple, IDORFinding] = {}
   for f in findings:
-    key = (f.url, f.parameter, f.idor_type)
+    key = (_url_template(f.url), f.parameter, f.idor_type)
     existing = best.get(key)
     if existing is None or _rank(f.confidence) < _rank(existing.confidence):
       best[key] = f
 
-  # Restore original ordering
   seen: set = set()
   result: List[IDORFinding] = []
   for f in findings:
-    key = (f.url, f.parameter, f.idor_type)
+    key = (_url_template(f.url), f.parameter, f.idor_type)
     if key not in seen and best.get(key) is f:
       seen.add(key)
       result.append(f)
@@ -684,14 +694,14 @@ def _classify_idor_type(
   Classify the IDOR type based on session mode and candidate origin.
 
   - Dual-session + foreign ID   → HORIZONTAL (peer access: attacker reaches owner's resource)
-  - Dual-session + non-foreign  → VERTICAL   (privilege escalation: attacker uses lower-priv session
-                                               to access a resource their own ID should not reach)
-  - Single-session + any        → HORIZONTAL (default: lateral access assumption in single-session mode)
+  - Dual-session + non-foreign  → HORIZONTAL (both sessions got 200 — lateral, not privilege)
+  - Single-session + any        → HORIZONTAL (default: lateral access assumption)
+
+  Note: VERTICAL is assigned explicitly by _check_direct_cross_session() when it
+  detects a 200-vs-4xx privilege gate between the two sessions.  Tamper-candidate
+  findings always return HORIZONTAL because the 200→4xx path is suppressed in
+  _verdict() before a finding is ever created.
   """
-  if is_dual and is_foreign:
-    return IDORType.HORIZONTAL
-  if is_dual:
-    return IDORType.VERTICAL
   return IDORType.HORIZONTAL
 
 
@@ -758,46 +768,78 @@ def _check_direct_cross_session(
   opts:       ScanOptions,
 ) -> Optional[IDORFinding]:
   """
-  Fundamental horizontal IDOR: session_b requests session_a's URL and gets
-  back session_a's ownership field values.  Works even when the comparator
-  misses it because both baselines look similar.
+  Cross-session checks on session_a's URL:
+
+  1. Horizontal IDOR (both 200): session_b sees session_a's ownership fields.
+  2. Vertical IDOR (A=200, B=403/401): session_b is blocked — flag as HIGH so
+     the analyst knows this endpoint is access-controlled and can focus further
+     testing on it (e.g. JWT tampering, method bypass).
   """
-  if a_baseline.status != 200 or b_baseline.status != 200:
-    return None
-
-  leaked = [
-    key for key, val in a_baseline.ownership_values.items()
-    if len(val) >= 8 and val in b_baseline.body
-  ]
-  if not leaked:
-    return None
-
   refs = extract_all(url, opts.method)
   first_ref = refs[0] if refs else None
 
-  return IDORFinding(
-    idor_type=IDORType.HORIZONTAL,
-    confidence=Confidence.CONFIRMED,
-    location=first_ref.location if first_ref else IDORLocation.PATH_SEGMENT,
-    url=url,
-    method=opts.method,
-    parameter=first_ref.param if first_ref else "[direct]",
-    id_type=first_ref.id_type if first_ref else IDType.UNKNOWN,
-    original_value=first_ref.value if first_ref else "",
-    tampered_value=first_ref.value if first_ref else "",
-    baseline_status=a_baseline.status,
-    tampered_status=b_baseline.status,
-    baseline_length=a_baseline.body_length,
-    tampered_length=b_baseline.body_length,
-    owner_fields_leaked=leaked,
-    evidence_snippet=b_baseline.body[:500],
-    session_a_label=opts.session_a_label,
-    session_b_label=opts.session_b_label,
-    notes=(
-      f"session_b directly accessed session_a's resource; "
-      f"ownership fields confirmed: {', '.join(leaked)}"
-    ),
-  )
+  # Case 1: horizontal IDOR — both sessions get 200, B sees A's ownership data
+  if a_baseline.status == 200 and b_baseline.status == 200:
+    leaked = [
+      key for key, val in a_baseline.ownership_values.items()
+      if len(val) >= 8 and val in b_baseline.body
+    ]
+    if not leaked:
+      return None
+    return IDORFinding(
+      idor_type=IDORType.HORIZONTAL,
+      confidence=Confidence.CONFIRMED,
+      location=first_ref.location if first_ref else IDORLocation.PATH_SEGMENT,
+      url=url,
+      method=opts.method,
+      parameter=first_ref.param if first_ref else "[direct]",
+      id_type=first_ref.id_type if first_ref else IDType.UNKNOWN,
+      original_value=first_ref.value if first_ref else "",
+      tampered_value=first_ref.value if first_ref else "",
+      baseline_status=a_baseline.status,
+      tampered_status=b_baseline.status,
+      baseline_length=a_baseline.body_length,
+      tampered_length=b_baseline.body_length,
+      owner_fields_leaked=leaked,
+      evidence_snippet=b_baseline.body[:500],
+      session_a_label=opts.session_a_label,
+      session_b_label=opts.session_b_label,
+      notes=(
+        f"session_b directly accessed session_a's resource; "
+        f"ownership fields confirmed: {', '.join(leaked)}"
+      ),
+    )
+
+  # Case 2: vertical access-control gate — A gets 200, B gets 4xx.
+  # Not an IDOR in itself (access is correctly denied), but a HIGH signal that
+  # the endpoint is privilege-gated, worth targeted follow-up testing.
+  if a_baseline.status == 200 and b_baseline.status in (401, 403):
+    return IDORFinding(
+      idor_type=IDORType.VERTICAL,
+      confidence=Confidence.HIGH,
+      location=first_ref.location if first_ref else IDORLocation.PATH_SEGMENT,
+      url=url,
+      method=opts.method,
+      parameter=first_ref.param if first_ref else "[direct]",
+      id_type=first_ref.id_type if first_ref else IDType.UNKNOWN,
+      original_value=first_ref.value if first_ref else "",
+      tampered_value=first_ref.value if first_ref else "",
+      baseline_status=a_baseline.status,
+      tampered_status=b_baseline.status,
+      baseline_length=a_baseline.body_length,
+      tampered_length=b_baseline.body_length,
+      owner_fields_leaked=[],
+      evidence_snippet=a_baseline.body[:200],
+      session_a_label=opts.session_a_label,
+      session_b_label=opts.session_b_label,
+      notes=(
+        f"{opts.session_a_label} can access this endpoint (200); "
+        f"{opts.session_b_label} is blocked ({b_baseline.status}) — "
+        f"privilege-gated endpoint confirmed"
+      ),
+    )
+
+  return None
 
 
 # Ownership field names we try to inject
@@ -931,9 +973,11 @@ def _check_soft_delete(
   if baseline.status not in (200, 404):
     return None
 
-  # Use session_b (attacker) in dual-session mode; fall back to session_a
-  req_headers = dict(pair.headers_for('b') if pair.is_dual else pair.headers_for('a'))
-  cookies = pair.cookies_for('b') if pair.is_dual else pair.cookies_for('a')
+  # Always use session_a for soft-delete checks — the baseline was captured with
+  # session_a, so growth comparisons must use the same session.  Using session_b
+  # would compare two different users' pages, producing false positives.
+  req_headers = dict(pair.headers_for('a'))
+  cookies = pair.cookies_for('a')
   if cookies:
     req_headers.setdefault('Cookie', cookies)
 

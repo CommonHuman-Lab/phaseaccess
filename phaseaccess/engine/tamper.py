@@ -278,7 +278,9 @@ def fire_request(
     for attempt in range(1 + _retries):
         t0 = time.time()
         try:
-            resp = client._session.request(method, url, data=body_bytes, timeout=timeout)
+            resp = client._session.request(
+                method, url, data=body_bytes, timeout=timeout, stream=True
+            )
         except Exception as exc:
             logger.debug("Network error on tampered request %s: %s", url, exc)
             return None
@@ -288,14 +290,28 @@ def fire_request(
         if resp.status_code == 429 and attempt < _retries:
             retry_after = int(resp.headers.get("Retry-After", "2"))
             logger.debug("Rate limited on %s — backing off %ds", url, retry_after)
+            resp.close()
             time.sleep(min(retry_after, 30))
             continue
+
+        # Cap body read to 512 KB — streaming/SSE endpoints never close otherwise.
+        ct = resp.headers.get("Content-Type", "")
+        if "event-stream" in ct:
+            resp.close()
+            return None
+        try:
+            body_bytes_raw = resp.raw.read(524288, decode_content=True)
+            body = body_bytes_raw.decode(resp.encoding or "utf-8", errors="replace")
+        except Exception:
+            body = ""
+        finally:
+            resp.close()
 
         return fingerprint_response(
             url=url,
             method=method,
             status=resp.status_code,
-            body=resp.text,
+            body=body,
             headers=dict(resp.headers),
             elapsed_ms=elapsed_ms,
             baseline_body=baseline_body,

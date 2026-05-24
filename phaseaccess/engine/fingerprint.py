@@ -175,7 +175,7 @@ def build_baseline(
       _sleep(delay)
 
   if not fps:
-    logger.warning("Baseline fetch failed for %s", url)
+    logger.debug("Baseline fetch skipped/failed for %s", url)
     return None
 
   # If we have two fetches, identify JSON field values that changed between
@@ -271,17 +271,32 @@ def _fetch_fingerprint(
 
     t0 = time.time()
     try:
-        resp = client._session.request(method, url, data=body_bytes, timeout=timeout)
+        resp = client._session.request(
+            method, url, data=body_bytes, timeout=timeout, stream=True
+        )
     except Exception as exc:
         logger.warning("Network error fetching %s: %s", url, exc)
         return None
 
     elapsed_ms = (time.time() - t0) * 1000
+    ct = resp.headers.get("Content-Type", "")
+    if "event-stream" in ct:
+        logger.debug("Skipping streaming endpoint %s", url)
+        resp.close()
+        return None
+    try:
+        body_bytes_raw = resp.raw.read(524288, decode_content=True)
+        body = body_bytes_raw.decode(resp.encoding or "utf-8", errors="replace")
+    except Exception:
+        body = ""
+    finally:
+        resp.close()
+
     return fingerprint_response(
         url=url,
         method=method,
         status=resp.status_code,
-        body=resp.text,
+        body=body,
         headers=dict(resp.headers),
         elapsed_ms=elapsed_ms,
     )

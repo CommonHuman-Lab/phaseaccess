@@ -423,13 +423,13 @@ def main() -> None:
     if getattr(args, "crawl", False) and args.url:
         from commonhuman_core.http import HttpClient
         from commonhuman_core.crawler import crawl as _crawl
-        crawl_headers = dict(session_a_headers)
-        if args.cookie:
-            crawl_headers.setdefault("Cookie", args.cookie)
+        crawl_headers = {k: v for k, v in session_a_headers.items() if k.lower() != "cookie"}
+        crawl_cookie = session_a_headers.get("Cookie", "") or args.cookie or ""
         crawl_client = HttpClient(
             timeout=args.timeout,
             proxy=args.proxy,
             headers=crawl_headers,
+            cookies=crawl_cookie,
             verify_ssl=not args.insecure,
         )
         if not args.quiet and not args.json_output:

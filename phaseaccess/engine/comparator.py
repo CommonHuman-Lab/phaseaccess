@@ -83,6 +83,7 @@ def compare(
   baseline:          ResponseFingerprint,
   tampered:          ResponseFingerprint,
   known_foreign_values: Optional[Dict[str, str]] = None,
+  is_dual:           bool = False,
 ) -> DiffResult:
   """
   Compare `baseline` (owner's response) with `tampered` (attacker's response).
@@ -187,13 +188,13 @@ def compare(
   #    Only fire when status codes are both 2xx (i.e. not a 404 fast-path).
   timing_signal = False
   if (
-    baseline.elapsed_ms > 0
+    baseline.elapsed_ms >= 50
     and tampered.elapsed_ms > 0
     and baseline.status in range(200, 300)
     and tampered.status in range(200, 300)
   ):
     ratio = tampered.elapsed_ms / baseline.elapsed_ms
-    if ratio > 3.0 or ratio < 0.33:
+    if ratio > 5.0 or ratio < 0.2:
       signals.append(
         f"timing delta: baseline {baseline.elapsed_ms:.0f}ms "
         f"→ tampered {tampered.elapsed_ms:.0f}ms (ratio {ratio:.1f}x)"
@@ -201,6 +202,7 @@ def compare(
       timing_signal = True
 
   # --- Derive verdict ---
+  _is_json = bool(baseline.structure_sig or tampered.structure_sig)
   verdict, confidence = _verdict(
     status_delta=status_delta,
     hash_changed=hash_changed,
@@ -212,6 +214,8 @@ def compare(
     baseline_status=baseline.status,
     tampered_status=tampered.status,
     timing_signal=timing_signal,
+    is_json=_is_json,
+    is_dual=is_dual,
   )
 
   # Extract diff snippet if no evidence yet
@@ -247,7 +251,19 @@ def _verdict(
   baseline_status:  int,
   tampered_status:  int,
   timing_signal:    bool = False,
+  is_json:          bool = False,
+  is_dual:          bool = False,
 ) -> Tuple[DiffVerdict, Confidence]:
+
+  # If tampered request was rejected (4xx/5xx) when baseline succeeded,
+  # the server correctly enforced access control — not an IDOR signal.
+  if baseline_status in range(200, 300) and tampered_status >= 400:
+    return DiffVerdict.UNCHANGED, Confidence.LOW
+
+  # Both baseline and tampered are error responses — different error codes
+  # between them (e.g. 405 vs 404) carry no IDOR meaning.
+  if baseline_status >= 400 and tampered_status >= 400:
+    return DiffVerdict.UNCHANGED, Confidence.LOW
 
   # CONFIRMED: ownership field with foreign value proven
   if any('CONFIRMED' in s for s in signals):
@@ -269,8 +285,15 @@ def _verdict(
   ):
     return DiffVerdict.LIKELY, Confidence.HIGH
 
-  # POSSIBLE: structural change or substantial content change
-  if struct_changed or (hash_changed and abs(length_delta) > 100):
+  # POSSIBLE: JSON structure change is always a strong signal
+  if struct_changed:
+    return DiffVerdict.POSSIBLE, Confidence.MEDIUM
+
+  # POSSIBLE: substantial content change, but only for JSON responses.
+  # HTML body changes alone are too noisy — public pages, different content
+  # items at different IDs, and auth-state nav differences all produce false
+  # positives without a JSON ownership-field or structural signal.
+  if is_json and hash_changed and abs(length_delta) > 100:
     return DiffVerdict.POSSIBLE, Confidence.MEDIUM
 
   # POSSIBLE: timing oracle fired (significant latency difference with 2xx/2xx)
