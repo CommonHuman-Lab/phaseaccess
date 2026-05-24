@@ -421,26 +421,31 @@ def main() -> None:
     form_scan_targets_raw: list = []
 
     if getattr(args, "crawl", False) and args.url:
-        from commonhuman_core.http import HttpClient
-        from commonhuman_core.crawler import crawl as _crawl
+        import asyncio as _asyncio
+        from commonhuman_core.http import AsyncHttpClient as _AsyncHttpClient
+        from commonhuman_core.crawler import async_crawl as _async_crawl
         crawl_headers = {k: v for k, v in session_a_headers.items() if k.lower() != "cookie"}
         crawl_cookie = session_a_headers.get("Cookie", "") or args.cookie or ""
-        crawl_client = HttpClient(
-            timeout=args.timeout,
-            proxy=args.proxy,
-            headers=crawl_headers,
-            cookies=crawl_cookie,
-            verify_ssl=not args.insecure,
-        )
         if not args.quiet and not args.json_output:
             print(DIM(f"[*] Crawling {args.url} (depth={args.crawl_depth}, max={args.crawl_pages} pages) ..."))
-        crawl_result = _crawl(
-            start_url=args.url,
-            injector=crawl_client,
-            max_pages=args.crawl_pages,
-            max_depth=args.crawl_depth,
-            threads=args.threads,
-        )
+        async def _do_crawl():
+            client = _AsyncHttpClient(
+                timeout=args.timeout,
+                proxy=args.proxy,
+                headers=crawl_headers,
+                cookies=crawl_cookie,
+                verify_ssl=not args.insecure,
+            )
+            try:
+                return await _async_crawl(
+                    start_url=args.url,
+                    client=client,
+                    max_pages=args.crawl_pages,
+                    max_depth=args.crawl_depth,
+                )
+            finally:
+                await client.aclose()
+        crawl_result = _asyncio.run(_do_crawl())
         seen = {args.url} | set(combined_extra_urls)
         discovered = [u for u in crawl_result.visited_urls if u not in seen and not _validate_extra_url(u)]
         combined_extra_urls.extend(discovered)
