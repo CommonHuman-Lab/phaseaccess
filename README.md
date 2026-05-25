@@ -4,6 +4,8 @@ The most thorough open-source IDOR / BOLA scanner available.
 PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *sessions*, and *evidence*.
 
 ```bash
+# Kali / Debian / Ubuntu — use a virtual env (required on externally-managed Python)
+python3 -m venv .venv && source .venv/bin/activate
 pip install phaseaccess
 
 # Install in virtual env
