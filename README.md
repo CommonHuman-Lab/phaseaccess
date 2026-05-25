@@ -1,6 +1,6 @@
 # PhaseAccess
 
-The most thorough open-source IDOR / BOLA scanner available.  
+Open-source IDOR / BOLA scanner.  
 PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *sessions*, and *evidence*.
 
 ```bash
