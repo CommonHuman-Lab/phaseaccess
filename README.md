@@ -86,6 +86,11 @@ phaseaccess -u "https://api.example.com/users/1" \
 phaseaccess -u "https://api.example.com/users/42" \
   -H "Authorization: Bearer <token>" \
   --min-confidence medium --json -o report.json
+
+# Save a plain-text summary
+phaseaccess -u "https://api.example.com/users/42" \
+  -H "Authorization: Bearer <token>" \
+  --text report.txt
 ```
 
 ---
@@ -166,8 +171,9 @@ Scan control:
 
 Output:
   --min-confidence     Minimum confidence to report: confirmed high medium low info
-  --json               Raw JSON output
-  -o, --output FILE    Save report to file
+  --json               Emit findings as JSON to stdout (suppresses banner)
+  -o, --output FILE    Write JSON results to FILE
+  --text FILE          Write plain-text summary to FILE
   -q, --quiet          Suppress live log output
   -v, --verbose        Debug logging
 ```
