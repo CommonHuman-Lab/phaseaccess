@@ -1,5 +1,17 @@
 # PhaseAccess
 
+<!-- markdownlint-disable MD033 -->
+<p align="left">
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-AGPL--3.0-white?style=for-the-badge&logo=opensourceinitiative&logoColor=black" alt="License">
+  </a>
+  <img src="https://img.shields.io/badge/Python-3.10+-black?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <a href="https://github.com/CommonHuman-Lab/gloomproxy">
+    <img src="https://img.shields.io/badge/GloomProxy-Plugin-black?style=for-the-badge" alt="GloomProxy Plugin">
+  </a>
+</p>
+<!-- markdownlint-enable MD033 -->
+
 Open-source IDOR / BOLA scanner.  
 PhaseAccess goes beyond simple ID enumeration — it understands *ownership*, *sessions*, and *evidence*.
 
@@ -315,6 +327,12 @@ Target URL(s)
            Highest-confidence per (url, param, type)
            curl reproduction command on every finding
 ```
+
+---
+
+## GloomProxy Plugin
+
+PhaseAccess ships pre-installed with [GloomProxy](https://github.com/CommonHuman-Lab/gloomproxy) and appears in the workspace UI out of the box — no extra setup needed.
 
 ---
 
