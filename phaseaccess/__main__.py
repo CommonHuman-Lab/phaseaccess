@@ -61,7 +61,8 @@ from typing import Any
 
 from commonhuman_cli.colour import RED, GREEN, YELLOW, CYAN, BOLD, DIM
 from commonhuman_cli.prompts import prompt, prompt_bool, section, safe_int
-from commonhuman_cli.entrypoint import parse_headers
+from commonhuman_cli.entrypoint import add_output_args, parse_headers
+from commonhuman_cli.output import write_json_output, write_text_output
 
 from phaseaccess.engine import scan, ScanOptions
 from phaseaccess.engine.reporter import Confidence, CONFIDENCE_RANK
@@ -201,6 +202,7 @@ def interactive_prompts() -> argparse.Namespace:
         no_soft_delete=not soft_delete,
         no_blind_idor=not blind_idor,
         json_output=False,
+        text="",
         quiet=False,
         verbose=False,
         output=output,
@@ -294,10 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-mass-assignment", action="store_true")
     p.add_argument("--no-soft-delete", action="store_true")
     p.add_argument("--no-blind-idor", action="store_true")
-    p.add_argument("--json", action="store_true", dest="json_output",
-                   help="Output raw JSON")
-    p.add_argument("-o", "--output", default="",
-                   help="Save report to file (human text, or JSON with --json)")
+    add_output_args(p)
     p.add_argument("-q", "--quiet", action="store_true",
                    help="Suppress live log output")
     p.add_argument("-v", "--verbose", action="store_true",
@@ -774,10 +773,9 @@ def main() -> None:
         ]
 
     if args.json_output:
-        output_text = json.dumps(result.to_dict(), indent=2)
-        print(output_text)
+        print(json.dumps(result.to_dict(), indent=2))
         if args.output:
-            _write_output(args.output, output_text)
+            write_json_output(result, args.output)
         sys.exit(0 if result.total_findings == 0 else 1)
 
     lines = _format_human(result, mode)
@@ -786,6 +784,8 @@ def main() -> None:
 
     if args.output:
         _write_output(args.output, output_text)
+    if args.text:
+        write_text_output(output_text, args.text)
 
     sys.exit(0 if result.total_findings == 0 else 1)
 

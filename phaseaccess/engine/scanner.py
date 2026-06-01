@@ -142,37 +142,49 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
   if not opts.verify_ssl:
     log("[!] SSL certificate verification disabled (--insecure)")
 
-  # Pre-compute session B's own identity values so we can exclude them from
-  # cross-session CONFIRMED verdicts.  Without this, the check fires a false
-  # positive whenever session B happens to be the resource owner at session A's
-  # URL (e.g. patient.john at /patients/1 — B's own record, not an IDOR).
+  # Pre-compute each session's own identity values.
+  #
+  # session_b_identity: exclude these from CONFIRMED verdicts so we don't
+  #   false-positive when B legitimately owns a resource at A's URL.
+  #
+  # session_a_identity: include these in cross-session checks with a lower
+  #   length threshold (>= 4 vs >= 8) — known-good identity values like a
+  #   short username ("alice") that appear in B's response are strong signals
+  #   even though they're too short to trust as anonymous ownership values.
   #
   # We probe a handful of well-known "own" paths; the first few that return 200
   # with extractable ownership values are enough.
+  import urllib.parse as _up2
+  _parsed_target = _up2.urlparse(target)
+  _origin = f"{_parsed_target.scheme}://{_parsed_target.netloc}"
+  _own_paths = ["", "/", "/dashboard", "/profile", "/me", "/account", "/home"]
+
   session_b_identity: Dict[str, str] = {}
+  session_a_identity: Dict[str, str] = {}
+
   if session_pair.is_dual:
-    import urllib.parse as _up2
-    _parsed_target = _up2.urlparse(target)
-    _origin = f"{_parsed_target.scheme}://{_parsed_target.netloc}"
-    _own_paths = ["", "/", "/dashboard", "/profile", "/me", "/account", "/home"]
-    for _own_path in _own_paths:
-      _own_url = _origin + _own_path
-      _own_fp = build_baseline(
-        url=_own_url,
-        method="GET",
-        headers=session_pair.headers_for("b"),
-        cookies=session_pair.cookies_for("b"),
-        proxy=opts.proxy,
-        timeout=opts.timeout,
-        verify_ssl=opts.verify_ssl,
-        repeats=1,
-      )
-      if _own_fp and _own_fp.status == 200 and _own_fp.ownership_values:
-        session_b_identity.update(_own_fp.ownership_values)
-        if len(session_b_identity) >= 3:
-          break
-    if session_b_identity:
-      log(f"[*] Session B identity harvested: {list(session_b_identity.keys())}")
+    for _session_label, _identity_map, _hdrs_fn, _cks_fn in (
+      ("b", session_b_identity, session_pair.headers_for, session_pair.cookies_for),
+      ("a", session_a_identity, session_pair.headers_for, session_pair.cookies_for),
+    ):
+      for _own_path in _own_paths:
+        _own_url = _origin + _own_path
+        _own_fp = build_baseline(
+          url=_own_url,
+          method="GET",
+          headers=_hdrs_fn(_session_label),
+          cookies=_cks_fn(_session_label),
+          proxy=opts.proxy,
+          timeout=opts.timeout,
+          verify_ssl=opts.verify_ssl,
+          repeats=1,
+        )
+        if _own_fp and _own_fp.status == 200 and _own_fp.ownership_values:
+          _identity_map.update(_own_fp.ownership_values)
+          if len(_identity_map) >= 3:
+            break
+      if _identity_map:
+        log(f"[*] Session {_session_label.upper()} identity harvested: {list(_identity_map.keys())}")
 
   # Harvested IDs from session_a responses (for ID chaining)
   harvested_pool: Dict[str, List[str]] = {}
@@ -183,7 +195,7 @@ def scan(target: str, opts: ScanOptions) -> ScanResult:
       pool.submit(
         _scan_endpoint,
         _url, _t_opts, _t_pair, harvested_pool, harvested_lock, log,
-        session_b_identity,
+        session_b_identity, session_a_identity,
       ): _url
       for _url, _t_opts, _t_pair in _all_targets
     }
@@ -227,6 +239,7 @@ def _scan_endpoint(
   harvested_lock:    threading.Lock,
   log:               Callable[[str], None],
   session_b_identity: Optional[Dict[str, str]] = None,
+  session_a_identity: Optional[Dict[str, str]] = None,
 ) -> ScanResult:
   """Scan a single endpoint and return a partial ScanResult."""
   partial = ScanResult(target=url)
@@ -321,7 +334,9 @@ def _scan_endpoint(
           known_foreign.setdefault(field_name, vals[0])
       # Direct access: session_b requests session_a's URL with session_a's ownership data visible
       cross_finding = _check_direct_cross_session(
-        url, baseline, b_baseline, opts, session_b_identity or {}
+        url, baseline, b_baseline, opts,
+        session_b_identity=session_b_identity or {},
+        session_a_identity=session_a_identity or {},
       )
       if cross_finding:
         partial.findings.append(cross_finding)
@@ -803,6 +818,7 @@ def _check_direct_cross_session(
   b_baseline:         ResponseFingerprint,
   opts:               ScanOptions,
   session_b_identity: Dict[str, str] = {},
+  session_a_identity: Dict[str, str] = {},
 ) -> Optional[IDORFinding]:
   """
   Cross-session checks on session_a's URL:
@@ -821,10 +837,28 @@ def _check_direct_cross_session(
   # values appearing in B's response are not evidence of cross-user leakage.
   if a_baseline.status == 200 and b_baseline.status == 200:
     b_own_values = set(session_b_identity.values())
+
+    # Pass 1: values extracted directly from the baseline response body.
+    # Threshold >= 8 to avoid false-positives from short generic values ("1", "ok").
     leaked = [
       key for key, val in a_baseline.ownership_values.items()
       if len(val) >= 8 and val in b_baseline.body and val not in b_own_values
     ]
+
+    # Pass 2: pre-harvested session A identity values (e.g. username "alice").
+    # Lower threshold (>= 4) is safe here because these are confirmed identity
+    # values — if "alice" appears in B's response at A's URL it is a real leak.
+    leaked_keys = set(leaked)
+    for key, val in session_a_identity.items():
+      if (
+        key not in leaked_keys
+        and len(val) >= 4
+        and val in b_baseline.body
+        and val not in b_own_values
+      ):
+        leaked.append(key)
+        leaked_keys.add(key)
+
     if not leaked:
       return None
     return IDORFinding(

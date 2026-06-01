@@ -127,10 +127,11 @@ def fingerprint_response(
   stable_hash  = hashlib.sha256(stable.encode()).hexdigest()[:16]
   json_keys, ownership, structure_sig = _analyse_json(body, content_type)
 
-  # Supplement with HTML-extracted PII when JSON parsing found nothing.
-  # This enables CONFIRMED verdicts on HTML pages whose responses change
-  # ownership-identifying values (SSN, email, etc.) between tamper targets.
-  if not ownership and 'html' in content_type:
+  # Supplement with regex-extracted PII when key-based extraction found nothing.
+  # Runs for any content type — JSON APIs that lack recognised key names (e.g.
+  # vendor-prefixed "x-user-email") still expose email addresses as literal
+  # strings that the regex can catch.
+  if not ownership:
     ownership = _extract_html_ownership(body)
 
   return ResponseFingerprint(

@@ -132,9 +132,25 @@ class TestPossibleVerdict:
         result = compare(baseline, tampered)
         assert result.verdict == DiffVerdict.POSSIBLE
 
-    def test_large_length_delta_with_hash_change_is_possible(self):
+    def test_large_length_delta_non_json_is_unchanged(self):
+        # Plain-text body changes are intentionally not flagged as POSSIBLE —
+        # HTML page differences (nav state, ads, recommendations) are too noisy
+        # without a JSON structure or ownership-field signal. Use JSON bodies
+        # with structure_sig to trigger the length-delta POSSIBLE verdict.
         baseline = _fp(body="a" * 100, stable_hash="hashA", ownership_values={})
         tampered = _fp(body="b" * 300, stable_hash="hashB", ownership_values={})
+        result = compare(baseline, tampered)
+        assert result.verdict == DiffVerdict.UNCHANGED
+
+    def test_large_length_delta_json_is_possible(self):
+        # JSON responses with large body change (delta > 100 bytes) DO trigger POSSIBLE
+        small = '{"items":[1]}'
+        large = '{"items":[' + ",".join(str(i) for i in range(50)) + ']}'
+        assert len(large) - len(small) > 100
+        baseline = _fp(body=small, stable_hash="hashA",
+                       structure_sig="{items:arr}", ownership_values={})
+        tampered = _fp(body=large, stable_hash="hashB",
+                       structure_sig="{items:arr}", ownership_values={})
         result = compare(baseline, tampered)
         assert result.verdict in (DiffVerdict.POSSIBLE, DiffVerdict.LIKELY)
 

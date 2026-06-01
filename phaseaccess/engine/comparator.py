@@ -296,6 +296,17 @@ def _verdict(
   if is_json and hash_changed and abs(length_delta) > 100:
     return DiffVerdict.POSSIBLE, Confidence.MEDIUM
 
+  # POSSIBLE: write IDOR — both sessions redirected (3xx) but to different
+  # locations. A POST/PUT/PATCH that returns 302 to /resource/<id> and the
+  # redirect target changes when the path ID is tampered means the write
+  # affected a different user's resource, even though no data is returned.
+  if (
+    baseline_status in range(300, 400)
+    and tampered_status in range(300, 400)
+    and hash_changed
+  ):
+    return DiffVerdict.POSSIBLE, Confidence.MEDIUM
+
   # POSSIBLE: timing oracle fired (significant latency difference with 2xx/2xx)
   if timing_signal:
     return DiffVerdict.POSSIBLE, Confidence.LOW

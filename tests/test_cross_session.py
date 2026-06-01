@@ -49,11 +49,14 @@ class TestCheckDirectCrossSession:
         result = _check_direct_cross_session("https://api.example.com/users/1", a, b, _make_opts())
         assert result is None
 
-    def test_returns_none_when_b_not_200(self):
+    def test_returns_vertical_finding_when_b_is_403(self):
+        # When A gets 200 and B is denied (403/401), the function returns a VERTICAL
+        # finding as a signal that the endpoint is privilege-gated — not None.
         a = _make_fp(status=200)
         b = _make_fp(status=403)
         result = _check_direct_cross_session("https://api.example.com/users/1", a, b, _make_opts())
-        assert result is None
+        assert result is not None
+        assert result.idor_type == IDORType.VERTICAL
 
     def test_returns_none_when_no_ownership_values(self):
         a = _make_fp(status=200, ownership={})

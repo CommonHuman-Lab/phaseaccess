@@ -33,10 +33,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gloomproxy = ["gloomproxy-sdk>=0.1.0"]
 dev = ["pytest>=7", "pytest-cov", "pytest-mock>=3.0"]
 
 [project.scripts]
 phaseaccess = "phaseaccess.__main__:main"
+
+[project.entry-points."gloomproxy.scanners"]
+phaseaccess = "phaseaccess.integrations.gloomproxy.plugin:PhaseAccessPlugin"
 
 [project.urls]
 Homepage = "https://github.com/commonhuman-lab/phaseaccess"
