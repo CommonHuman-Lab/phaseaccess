@@ -142,8 +142,30 @@ def compare(
   base_ownership    = baseline.ownership_values
   tampered_ownership = tampered.ownership_values
 
+  # "Ambient session" keys (profile_username, greeting_name, heading_username)
+  # are extracted from nav-bar and greeting elements that naturally show the
+  # currently logged-in user's identity.  In dual-session testing they ALWAYS
+  # differ between sessions because each user's nav shows their own name —
+  # this is not evidence of IDOR.
+  _AMBIENT_KEYS = frozenset({'profile_username', 'greeting_name', 'heading_username'})
+
   for field_name, tampered_val in tampered_ownership.items():
     base_val = base_ownership.get(field_name)
+
+    if field_name in _AMBIENT_KEYS:
+      # Only flag if the *baseline* identity value appears in the tampered body.
+      if (
+        base_val
+        and len(base_val) >= 6
+        and base_val != tampered_val
+        and base_val in tampered.body
+      ):
+        signals.append(
+          f"owner identity {field_name!r} present in tampered: {base_val!r}"
+        )
+        leaked_fields.append(field_name)
+        evidence = f"{field_name}: {base_val!r} found in tampered response"
+      continue
 
     if base_val is None:
       # Ownership field appeared that wasn't in baseline
@@ -164,6 +186,11 @@ def compare(
   # 7. Known-foreign value present in tampered body
   if known_foreign_values:
     for field_name, foreign_val in known_foreign_values.items():
+      if field_name in _AMBIENT_KEYS:
+        # Ambient session keys (nav bar identity) naturally appear in every
+        # response for the session they belong to — don't use them as
+        # cross-user leakage evidence.
+        continue
       if (
         foreign_val
         and len(foreign_val) >= 8

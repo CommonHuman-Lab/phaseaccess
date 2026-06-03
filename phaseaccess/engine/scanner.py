@@ -510,7 +510,7 @@ def _run_method_bypass(
   )
   partial.requests_sent += len(method_results)
   for mr in method_results:
-    diff = compare(baseline, mr.fingerprint, known_foreign or None, is_dual=pair.is_dual)
+    diff = compare(baseline, mr.fingerprint, None, is_dual=pair.is_dual)
     if diff.verdict in (DiffVerdict.CONFIRMED, DiffVerdict.LIKELY):
       partial.findings.append(_make_finding(
         idor_type=IDORType.METHOD_BYPASS,
@@ -831,11 +831,32 @@ def _check_direct_cross_session(
   refs = extract_all(url, opts.method)
   first_ref = refs[0] if refs else None
 
+  # Gate the horizontal ownership-leak check to prevent false positives on shared
+  # pages (/lobby, /leaderboard, /chat) where every user's identity legitimately
+  # appears.  Fire if EITHER:
+  #   (a) The URL contains a resource-identifying path segment or query param, OR
+  #   (b) The baseline contains concrete (non-ambient) ownership values such as
+  #       email, SSN, insurance_id, user_id — signals that only appear on
+  #       user-specific resource pages, not shared communal pages.
+  #
+  # Ambient-only keys (profile_username, greeting_name, heading_username) are
+  # extracted from nav bars and greetings that appear on every authenticated page;
+  # they are not reliable as sole evidence of resource ownership.
+  _has_resource_ref = any(
+    r.location in (IDORLocation.PATH_SEGMENT, IDORLocation.QUERY_PARAM)
+    and r.id_type not in (IDType.UNKNOWN, IDType.SLUG)
+    for r in refs
+  )
+  _AMBIENT_ONLY = frozenset({'profile_username', 'greeting_name', 'heading_username'})
+  _has_concrete_ownership = any(
+    k not in _AMBIENT_ONLY for k in a_baseline.ownership_values
+  )
+
   # Case 1: horizontal IDOR — both sessions get 200, B sees A's ownership data.
   # Values that belong to session B's own identity are excluded — if B is the
   # legitimate owner of a resource (e.g. /resource/1 belongs to user B), those
   # values appearing in B's response are not evidence of cross-user leakage.
-  if a_baseline.status == 200 and b_baseline.status == 200:
+  if a_baseline.status == 200 and b_baseline.status == 200 and (_has_resource_ref or _has_concrete_ownership):
     b_own_values = set(session_b_identity.values())
 
     # Pass 1: values extracted directly from the baseline response body.

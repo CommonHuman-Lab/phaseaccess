@@ -364,14 +364,73 @@ _PHONE_RE = re.compile(
   r'\b(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4})\b'
 )
 
+# Greeting patterns — "Welcome back, Alice Porter" / "Good morning, dr.carter"
+# Handles both proper-name greetings and lowercase username greetings.
+_GREETING_RE = re.compile(
+  r'(?:Welcome\s+back|Welcome|Hello|Greetings|Hi|Good\s+morning|Good\s+afternoon|Good\s+evening)'
+  r'\b[^A-Za-z]{0,3}'
+  r'([A-Za-z][A-Za-z0-9_.]{2,49}(?:\s+[A-Z][a-zA-Z]+)*)',
+)
+
+# <a href="/profile/2">alice.p</a> — profile link anchor text as username signal.
+# Covers common user-ownership URL prefixes across many apps.
+_PROFILE_ANCHOR_RE = re.compile(
+  r'<a\b[^>]*\bhref=["\'][^"\']*/'
+  r'(?:profile|user|users|member|members|player|players|patient|patients|'
+  r'accounts?|admin/users?|admin/staff|suite|staff|customer|customers)/\d+[^"\']*["\'][^>]*>'
+  r'([A-Za-z0-9][^<]{2,49})</a>',
+  re.IGNORECASE | re.DOTALL,
+)
+
+# <h1>TRADER — alice.p</h1> — entity-type heading with username
+_HEADING_USER_RE = re.compile(
+  r'<(?:h[1-3]|title)\b[^>]*>[^<]*?'
+  r'(?:TRADER|USER|PATIENT|MEMBER|CUSTOMER|PLAYER|STAFF|ACCOUNT|SUBSCRIBER)\s*'
+  r'[—–\-]+\s*([A-Za-z0-9][A-Za-z0-9_.@+\-]{3,49})',
+  re.IGNORECASE,
+)
+
+# <h1>lucky_larry's Transactions</h1> — possessive username in headings.
+# The "owner" identifier is the token immediately before 's.
+# Require at least one non-alpha character (dot/underscore/digit) or a digit
+# suffix to avoid matching common English possessives like "Today's".
+_POSSESSIVE_HEADING_RE = re.compile(
+  r"<h[1-3][^>]*>([A-Za-z][A-Za-z0-9_.]{2,39})'s\s+\w",
+  re.IGNORECASE,
+)
+
+_GENERIC_LINK_TEXT = frozenset({
+  'profile', 'edit profile', 'view profile', 'my profile', 'user profile',
+  'settings', 'account', 'details', 'edit', 'view', 'click here', 'admin',
+  'dashboard', 'back', 'home', 'update', 'manage', 'delete',
+})
+
+# <strong>dr.carter</strong> — bolded username in message/activity context.
+_STRONG_USERNAME_RE = re.compile(
+  r'<strong\b[^>]*>([A-Za-z][A-Za-z0-9_.]{2,39})</strong>',
+  re.IGNORECASE,
+)
+
+# Supplementary: links to /profile (no numeric ID) whose text looks like a
+# username — <a href="/profile">alice.wang</a>.  Must contain a dot, underscore,
+# or digit so we don't capture English words ("Read", "More", etc.).
+_PROFILE_NOID_RE = re.compile(
+  r'<a\b[^>]*href=["\'][^"\']*/'
+  r'(?:profile|account|member|user|staff|patient)/?["\'][^>]*>'
+  r'([A-Za-z][A-Za-z0-9_.\-]{2,39})</a>',
+  re.IGNORECASE,
+)
+
+
 def _extract_html_ownership(body: str) -> Dict[str, str]:
   """
-  Regex-scan an HTML body for PII-like ownership markers: emails, SSNs,
-  insurance/account IDs, and phone numbers.  Returns the first match per
-  category keyed by a stable field name — enough to confirm cross-user
-  leakage when these values change between baseline and tampered responses.
+  Regex-scan an HTML body for ownership markers: PII (emails, SSNs, insurance
+  IDs, phone numbers) and structural signals (greeting names, profile link text,
+  entity-type headings).  Returns one value per category — enough to confirm
+  cross-user leakage when these values differ between baseline and tampered.
   """
   result: Dict[str, str] = {}
+
   m = _EMAIL_RE.search(body)
   if m:
     result['email'] = m.group(1)
@@ -384,6 +443,80 @@ def _extract_html_ownership(body: str) -> Dict[str, str]:
   m = _PHONE_RE.search(body)
   if m:
     result['phone'] = m.group(1).strip()
+
+  # Greeting name: "Welcome back, Alice Porter"
+  m = _GREETING_RE.search(body)
+  if m:
+    name = m.group(1).strip()
+    if len(name) >= 6:
+      result['greeting_name'] = name
+
+  # Profile link anchor text — collect first and second distinct profile link texts.
+  # The first match is usually the nav bar showing the CURRENT user's display name
+  # (ambient session signal → profile_username).  A second DISTINCT match is
+  # typically the resource OWNER's username in the page content (resource-specific
+  # signal → profile_owner).  Both are checked in the cross-session analysis.
+  _seen_profile_texts: list = []
+  # Primary: links that include a numeric user ID (e.g. /profile/2, /admin/users/3)
+  for m in _PROFILE_ANCHOR_RE.finditer(body):
+    text = m.group(1).strip()
+    text_lc = text.lower()
+    if (len(text) >= 4
+        and text_lc not in _GENERIC_LINK_TEXT
+        and not any(t.lower() == text_lc for t in _seen_profile_texts)):
+      _seen_profile_texts.append(text)
+      if len(_seen_profile_texts) >= 2:
+        break
+  # Fallback: links to /profile (no ID) whose text looks like a username
+  # (contains dot/underscore/digit).  Captures <a href="/profile">alice.wang</a>
+  # in apps that use the current user's profile path without an explicit ID.
+  if not _seen_profile_texts:
+    for m in _PROFILE_NOID_RE.finditer(body):
+      text = m.group(1).strip()
+      text_lc = text.lower()
+      if (len(text) >= 4
+          and text_lc not in _GENERIC_LINK_TEXT
+          and re.search(r'[._\d]', text)
+          and not any(t.lower() == text_lc for t in _seen_profile_texts)):
+        _seen_profile_texts.append(text)
+        if len(_seen_profile_texts) >= 2:
+          break
+  if _seen_profile_texts:
+    result['profile_username'] = _seen_profile_texts[0]
+  if len(_seen_profile_texts) >= 2:
+    result['profile_owner'] = _seen_profile_texts[1]
+
+  # Heading username: <h1>TRADER — alice.p</h1>
+  m = _HEADING_USER_RE.search(body)
+  if m:
+    text = m.group(1).strip()
+    if len(text) >= 4:
+      result['heading_username'] = text
+
+  # Possessive heading username: <h1>lucky_larry's Transactions</h1>
+  # Only capture if the token looks like a username (contains dot/underscore/digit),
+  # not a common English possessive like "Today" or "Player".
+  if 'possessive_name' not in result:
+    m = _POSSESSIVE_HEADING_RE.search(body)
+    if m:
+      text = m.group(1).strip()
+      if (len(text) >= 4 and
+          (re.search(r'[._\d]', text) or text[0].islower())):
+        result['possessive_name'] = text
+
+  # <strong>dr.carter</strong> — bolded username in message sender/activity context.
+  # Only capture if text looks like a username (has dot/underscore/digit).
+  if 'strong_username' not in result:
+    for m in _STRONG_USERNAME_RE.finditer(body):
+      text = m.group(1).strip()
+      # Require a dot or underscore — prevents hex hashes and pure-digit values
+      # from being captured (they pass the digit check but aren't usernames).
+      if (len(text) >= 4
+          and re.search(r'[._]', text)
+          and text.lower() not in _GENERIC_LINK_TEXT):
+        result['strong_username'] = text
+        break
+
   return result
 
 

@@ -228,8 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-u", "--url", default="", help="Target URL")
     p.add_argument("--crawl", action="store_true",
                    help="Crawl target before scanning to auto-discover endpoints")
-    p.add_argument("--crawl-depth", type=int, default=3, dest="crawl_depth",
-                   help="Crawler max depth (default 3)")
+    p.add_argument("--crawl-depth", type=int, default=4, dest="crawl_depth",
+                   help="Crawler max depth (default 4)")
     p.add_argument("--crawl-pages", type=int, default=100, dest="crawl_pages",
                    help="Crawler max pages (default 100)")
     p.add_argument("--browser-crawl", action="store_true", dest="browser_crawl",
